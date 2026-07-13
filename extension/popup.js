@@ -107,14 +107,25 @@ els.signInBtn.addEventListener("click", () => {
   // The worker finishes the exchange and stores the session either way; if
   // this popup is still alive when it responds, re-render in place.
   chrome.runtime.sendMessage({ type: "hermes:sign-in" }, (response) => {
-    if (chrome.runtime.lastError || !response) return;
-    if (response.ok) {
+    if (response?.ok) {
       render();
-    } else {
-      els.signInBtn.disabled = false;
-      els.signInBtn.textContent = "Sign in with Google";
-      alert(response.error || "Sign-in failed. Please try again.");
+      return;
     }
+
+    els.signInBtn.disabled = false;
+    els.signInBtn.textContent = "Sign in with Google";
+
+    if (chrome.runtime.lastError || !response) {
+      // Usually means the background service worker isn't registered —
+      // e.g. the extension wasn't reloaded after an update.
+      alert(
+        `Couldn't reach the extension's background worker (${chrome.runtime.lastError?.message || "no response"}). ` +
+          "Reload the extension from chrome://extensions and try again.",
+      );
+      return;
+    }
+
+    alert(response.error || "Sign-in failed. Please try again.");
   });
 });
 
