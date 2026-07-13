@@ -1,16 +1,17 @@
 import { getSession, setSession, clearSession } from "./js/storage.js";
-import { exchangeCode, fetchMe, logout, submitProfile, UnauthorizedError } from "./js/api.js";
-import { launchGoogleSignIn } from "./js/auth.js";
-import { isLinkedInProfileUrl, normalizeProfileUrl } from "./js/linkedin.js";
+import { fetchMe, logout, submitProfile, UnauthorizedError } from "./js/api.js";
+import { isLinkedInUrl, isLinkedInProfileUrl, normalizeProfileUrl } from "./js/linkedin.js";
 
 const states = {
   loading: document.getElementById("state-loading"),
+  notLinkedIn: document.getElementById("state-not-linkedin"),
   signedOut: document.getElementById("state-signed-out"),
   noProfile: document.getElementById("state-no-profile"),
   profile: document.getElementById("state-profile"),
 };
 
 const els = {
+  openLinkedInBtn: document.getElementById("open-linkedin-btn"),
   signInBtn: document.getElementById("sign-in-btn"),
   signOutBtn1: document.getElementById("sign-out-btn-1"),
   signOutBtn2: document.getElementById("sign-out-btn-2"),
@@ -47,6 +48,16 @@ async function handleUnauthorized() {
 
 async function render() {
   showState("loading");
+
+  const tabUrl = await getActiveTabUrl();
+
+  // The extension only does anything on LinkedIn — show the blank state
+  // everywhere else, signed in or not.
+  if (!isLinkedInUrl(tabUrl)) {
+    showState("notLinkedIn");
+    return;
+  }
+
   const { token, user } = await getSession();
 
   if (!token) {
@@ -67,8 +78,6 @@ async function render() {
     // Network/other error: fall back to cached user info rather than blocking the popup.
   }
 
-  const tabUrl = await getActiveTabUrl();
-
   if (isLinkedInProfileUrl(tabUrl)) {
     els.accountName2.textContent = freshUser?.name || "";
     els.accountEmail2.textContent = freshUser?.email || "";
@@ -84,21 +93,29 @@ async function render() {
   }
 }
 
-els.signInBtn.addEventListener("click", async () => {
+els.openLinkedInBtn.addEventListener("click", () => {
+  chrome.tabs.create({ url: "https://www.linkedin.com" });
+  window.close();
+});
+
+els.signInBtn.addEventListener("click", () => {
   els.signInBtn.disabled = true;
   els.signInBtn.textContent = "Signing in…";
-  try {
-    const code = await launchGoogleSignIn();
-    const result = await exchangeCode(code);
-    if (!result?.token) throw new Error("Sign-in failed. Please try again.");
-    await setSession(result.token, result.user);
-    await render();
-  } catch (err) {
-    els.signInBtn.textContent = "Sign in with Google";
-    alert(err.message || "Sign-in failed. Please try again.");
-  } finally {
-    els.signInBtn.disabled = false;
-  }
+
+  // The flow runs in the background service worker: the auth window steals
+  // focus and Chrome closes this popup, so any work here would die mid-flow.
+  // The worker finishes the exchange and stores the session either way; if
+  // this popup is still alive when it responds, re-render in place.
+  chrome.runtime.sendMessage({ type: "hermes:sign-in" }, (response) => {
+    if (chrome.runtime.lastError || !response) return;
+    if (response.ok) {
+      render();
+    } else {
+      els.signInBtn.disabled = false;
+      els.signInBtn.textContent = "Sign in with Google";
+      alert(response.error || "Sign-in failed. Please try again.");
+    }
+  });
 });
 
 async function handleSignOut() {
