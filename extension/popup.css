@@ -40,6 +40,12 @@ body {
   gap: 10px;
 }
 
+/* display: flex above would otherwise beat the UA stylesheet's [hidden] rule,
+   making every state section render at once. */
+.state[hidden] {
+  display: none;
+}
+
 .text {
   margin: 0;
   line-height: 1.4;
