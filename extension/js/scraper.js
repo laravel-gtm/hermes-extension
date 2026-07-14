@@ -13,6 +13,9 @@ export function scrapeLinkedInProfile() {
     !text ||
     text === fullName ||
     /^\d+(st|nd|rd)\+?\s*degree connection$/i.test(text) ||
+    /^·?\s*\d+(st|nd|rd|th)\+?$/i.test(text) ||
+    /^\(?\s*(he|she|they|ze|xe|ey)\s*\/\s*[a-z]+\s*\)?$/i.test(text) ||
+    /^contact info$/i.test(text) ||
     /connections?$/i.test(text) ||
     /followers?$/i.test(text);
 
@@ -123,7 +126,12 @@ export function scrapeLinkedInProfile() {
 
       const dateCandidate = boldCandidates.find((text) => /\d{4}/.test(text) || /present/i.test(text));
       const dateRange = dateCandidate || null;
-      const isCurrent = /present/i.test(dateRange || "");
+      // "Present" only appears in English UIs; a completed range always
+      // carries both a start and an end year, so a single year is the
+      // locale-independent signal that the role is ongoing ("ene 2024 -
+      // actualidad"). No dateRange at all stays false (unknown).
+      const yearCount = (dateRange?.match(/\d{4}/g) || []).length;
+      const isCurrent = dateRange !== null && (/present/i.test(dateRange) || yearCount < 2);
 
       return {
         title,
