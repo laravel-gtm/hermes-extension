@@ -1,6 +1,7 @@
 import { getSession, setSession, clearSession } from "./js/storage.js";
 import { fetchMe, logout, submitProfile, UnauthorizedError } from "./js/api.js";
 import { isLinkedInUrl, isLinkedInProfileUrl, normalizeProfileUrl } from "./js/linkedin.js";
+import { scrapeLinkedInProfile } from "./js/scraper.js";
 
 const states = {
   loading: document.getElementById("state-loading"),
@@ -36,9 +37,30 @@ function showFeedback(message, kind) {
   els.feedback.hidden = false;
 }
 
-async function getActiveTabUrl() {
+async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab;
+}
+
+async function getActiveTabUrl() {
+  const tab = await getActiveTab();
   return tab?.url || "";
+}
+
+// Scraping is best-effort: LinkedIn's DOM is obfuscated and changes without
+// notice, so any failure here (including on pages executeScript can't touch,
+// e.g. chrome:// or a not-yet-loaded tab) must fall back to null rather than
+// block the URL-only submission that already works today.
+async function capturePageData(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: scrapeLinkedInProfile,
+    });
+    return results?.[0]?.result || null;
+  } catch {
+    return null;
+  }
 }
 
 async function handleUnauthorized() {
@@ -149,9 +171,10 @@ els.addProfileBtn.addEventListener("click", async () => {
   els.feedback.hidden = true;
   try {
     const { token } = await getSession();
-    const tabUrl = await getActiveTabUrl();
-    const url = normalizeProfileUrl(tabUrl);
-    const { status, data } = await submitProfile(token, url);
+    const tab = await getActiveTab();
+    const url = normalizeProfileUrl(tab?.url || "");
+    const page = tab?.id != null ? await capturePageData(tab.id) : null;
+    const { status, data } = await submitProfile(token, url, page);
 
     if (status === 201) {
       showFeedback("Profile queued for Hermes.", "success");

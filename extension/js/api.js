@@ -49,11 +49,11 @@ export async function logout(token) {
   await request("/api/extension/auth/logout", { method: "POST", token });
 }
 
-export async function submitProfile(token, url) {
+export async function submitProfile(token, url, page = null) {
   const { status, data } = await request("/api/extension/profiles", {
     method: "POST",
     token,
-    body: { url },
+    body: { url, page },
   });
   return { status, data };
 }

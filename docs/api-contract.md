@@ -152,11 +152,25 @@ Request:
 
 ```json
 {
-  "url": "https://www.linkedin.com/in/SLUG"
+  "url": "https://www.linkedin.com/in/SLUG",
+  "page": {
+    "fullName": "Ada Lovelace",
+    "headline": "Software Engineer at Foo",
+    "location": "London, England, United Kingdom",
+    "mostRecentPosition": {
+      "title": "Software Engineer",
+      "companyName": "Foo",
+      "companyUrl": "https://www.linkedin.com/company/foo",
+      "isCurrent": true,
+      "dateRange": "Jan 2020 - Present · 3 yrs"
+    }
+  }
 }
 ```
 
-Validation and normalization are defined in [LinkedIn URL validation and normalization](#linkedin-url-validation-and-normalization).
+`page` is optional and may be `null` or absent; the extension sends it on a best-effort basis and omits or nulls it whenever the profile page couldn't be scraped. Every field inside `page` and `mostRecentPosition` (except `isCurrent`, always a boolean) is independently nullable — treat all of them as optional, unvalidated hints rather than trusted input.
+
+Validation and normalization for `url` are defined in [LinkedIn URL validation and normalization](#linkedin-url-validation-and-normalization). `page` is not validated; the server should accept it as opaque supplementary data.
 
 New capture — `201 Created`:
 
