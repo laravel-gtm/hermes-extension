@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Hermes LinkedIn Capture",
+  "version": "1.2.0",
+  "description": "Send LinkedIn profile URLs to Hermes with one click.",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvztN7o6E1k9KLfvRW2itPdqC/0AeC9nrB483OEc+bxs6nwYAoY21RTZdOOxCQjwdfonKukKtZIWshJy/MDpNz/Imwn6vifZcp99XwMhj/VvhjoHZRkmlRWxu1X9MyJlOSvdV/9uGrCfOmXzcYhdmrwTXvCD1diWy164Cw9ne5tE+ZtohPyT9mDIR8APdpmg85p5T3KxmjGnSMNdUuZ2aD0D0QlpPrUwB+YASOd3e7YwFeRoCiTUT3xpTLhfdx8AJJw4l5hWyClk0P+hgeVOAzfUhzsvABggBx8EACVxcoFj94BoTiADruMlkhUAKh0ymtWly5Lem6mryGO2KByiAXQIDAQAB",
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": ["identity", "storage", "activeTab", "scripting"],
+  "host_permissions": ["https://hermes.laravel-demo.cloud/*"]
+}

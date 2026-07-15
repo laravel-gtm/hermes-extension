@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Hermes LinkedIn Capture</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="header">
+      <img src="icons/icon32.png" alt="" class="logo" />
+      <span class="title">Hermes</span>
+    </header>
+
+    <main id="app">
+      <!-- Not on LinkedIn at all -->
+      <section id="state-not-linkedin" class="state" hidden>
+        <p class="text">Go to LinkedIn to use this extension.</p>
+        <button id="open-linkedin-btn" class="btn btn-primary">Open LinkedIn</button>
+      </section>
+
+      <!-- Signed-out state -->
+      <section id="state-signed-out" class="state" hidden>
+        <p class="text">Sign in to start adding LinkedIn profiles to Hermes.</p>
+        <button id="sign-in-btn" class="btn btn-primary">Sign in with Google</button>
+      </section>
+
+      <!-- Signed-in, not on a profile page -->
+      <section id="state-no-profile" class="state" hidden>
+        <div class="account">
+          <div class="account-name" id="account-name-1"></div>
+          <div class="account-email" id="account-email-1"></div>
+        </div>
+        <p class="text hint">Open a LinkedIn profile page (linkedin.com/in/&hellip;) to add it to Hermes.</p>
+        <button id="sign-out-btn-1" class="btn btn-link">Sign out</button>
+      </section>
+
+      <!-- Signed-in, on a profile page -->
+      <section id="state-profile" class="state" hidden>
+        <div class="account">
+          <div class="account-name" id="account-name-2"></div>
+          <div class="account-email" id="account-email-2"></div>
+        </div>
+        <p class="text profile-url" id="profile-url"></p>
+        <button id="add-profile-btn" class="btn btn-primary">Add profile to Hermes</button>
+        <p id="feedback" class="feedback" hidden></p>
+        <button id="sign-out-btn-2" class="btn btn-link">Sign out</button>
+      </section>
+
+      <!-- Loading -->
+      <section id="state-loading" class="state">
+        <p class="text">Loading&hellip;</p>
+      </section>
+    </main>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
