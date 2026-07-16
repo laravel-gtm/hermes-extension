@@ -1,7 +1,7 @@
 import { getSession, setSession, clearSession } from "./js/storage.js";
 import { fetchMe, logout, submitProfile, UnauthorizedError } from "./js/api.js";
 import { isLinkedInUrl, isLinkedInProfileUrl, normalizeProfileUrl } from "./js/linkedin.js";
-import { scrapeLinkedInProfile } from "./js/scraper.js";
+import { collectProfileSignals, parseProfileFromRaw } from "./js/scraper.js";
 
 const states = {
   loading: document.getElementById("state-loading"),
@@ -51,13 +51,18 @@ async function getActiveTabUrl() {
 // notice, so any failure here (including on pages executeScript can't touch,
 // e.g. chrome:// or a not-yet-loaded tab) must fall back to null rather than
 // block the URL-only submission that already works today.
+//
+// The injected collector only harvests raw signals from the page; the parsing
+// and validation run here in the popup (parseProfileFromRaw), where they're
+// unit-tested. See extension/js/scraper.js.
 async function capturePageData(tabId) {
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId },
-      func: scrapeLinkedInProfile,
+      func: collectProfileSignals,
     });
-    return results?.[0]?.result || null;
+    const raw = results?.[0]?.result;
+    return raw ? parseProfileFromRaw(raw) : null;
   } catch {
     return null;
   }
