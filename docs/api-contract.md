@@ -4,6 +4,14 @@ This document is the implementation contract between the Hermes Laravel applicat
 
 All `/api/extension/*` requests and responses use JSON except the successful logout response, which has no body. Clients send `Accept: application/json` and, for requests with a body, `Content-Type: application/json`.
 
+Every request the extension makes — authenticated or not, popup or background — also sends:
+
+```http
+X-Hermes-Extension-Version: 1.4.0
+```
+
+This is the version from the installed extension's `manifest.json` (read at runtime via `chrome.runtime.getManifest().version`), not a hardcoded value. The server does not require this header to process a request; it is informational and used by the version-gate endpoint below.
+
 ## Contract summary
 
 | Method | Route | Authentication | Success |
@@ -11,7 +19,8 @@ All `/api/extension/*` requests and responses use JSON except the successful log
 | `GET` | `/extension/auth/start` | Browser session / existing Google SSO flow | Redirect to the extension callback with a one-time code |
 | `POST` | `/api/extension/auth/exchange` | One-time exchange code | `200` with a Sanctum token and user |
 | `GET` | `/api/extension/me` | Sanctum bearer token | `200` with user |
-| `POST` | `/api/extension/profiles` | Sanctum bearer token with `extension:capture` | `201` queued or `200` duplicate |
+| `GET` | `/api/extension/version` | None | `200` always, with supportability |
+| `POST` | `/api/extension/profiles` | Sanctum bearer token with `extension:capture` | `201` queued, `200` duplicate, or `200` unsupported version |
 | `POST` | `/api/extension/auth/logout` | Sanctum bearer token | `204`, current token revoked |
 
 ## Browser authentication flow
@@ -136,6 +145,32 @@ Missing, invalid, expired, or revoked token — `401 Unauthorized`:
 
 The extension treats a `401` from any protected endpoint as signed out and removes its locally stored token.
 
+### `GET /api/extension/version`
+
+Checked by the popup on every open so an unsupported extension build can be blocked before it does anything else.
+
+Authentication: none.
+
+Request:
+
+```http
+GET /api/extension/version?version=1.4.0
+```
+
+`version` is the calling extension's `manifest.json` version, URL-encoded.
+
+Response — always `200 OK`, never an error status for a well-formed request:
+
+```json
+{
+  "supported": true,
+  "minimum_version": "1.4.0",
+  "latest_release_url": "https://github.com/laravel-gtm/hermes-extension/releases/latest"
+}
+```
+
+`supported` is `false` only when the calling version is below `minimum_version`. The extension treats anything other than an explicit `200` with `supported === false` as "fail open" — network errors, timeouts, non-200 statuses, and malformed bodies all proceed with the normal popup flow rather than blocking the user.
+
 ### `POST /api/extension/profiles`
 
 Submits one normalized LinkedIn profile URL for asynchronous capture.
@@ -191,6 +226,16 @@ Already captured — `200 OK`:
 ```
 
 Duplicate detection uses the normalized URL and must be race-safe, preferably with a database unique constraint plus an insert-or-detect-conflict operation. "Already captured" is application-wide unless Hermes's existing data model requires a tenant scope; if it does, apply that scope consistently without changing this HTTP response.
+
+Unsupported extension version — `200 OK`:
+
+```json
+{
+  "status": "unsupported_version"
+}
+```
+
+Returned instead of creating a capture record when the calling extension's `X-Hermes-Extension-Version` is below the current minimum. No `page`/`url` processing occurs. The extension treats this the same as an unsupported response from `GET /api/extension/version` — it replaces the popup with the upgrade-only screen — covering the case where the minimum version was raised after the popup already loaded.
 
 Invalid URL — `422 Unprocessable Content`:
 

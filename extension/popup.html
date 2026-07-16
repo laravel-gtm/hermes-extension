@@ -12,6 +12,12 @@
     </header>
 
     <main id="app">
+      <!-- Unsupported extension version: no auth/capture UI, only an upgrade link -->
+      <section id="state-unsupported" class="state" hidden>
+        <p class="text">This version of the Hermes extension is no longer supported.</p>
+        <button id="get-latest-btn" class="btn btn-primary">Get the latest version</button>
+      </section>
+
       <!-- Not on LinkedIn at all -->
       <section id="state-not-linkedin" class="state" hidden>
         <p class="text">Go to LinkedIn to use this extension.</p>
