@@ -7,8 +7,11 @@ export class UnauthorizedError extends Error {
   }
 }
 
-async function request(path, { method = "GET", token, body } = {}) {
-  const headers = { Accept: "application/json" };
+async function request(path, { method = "GET", token, body, signal } = {}) {
+  const headers = {
+    Accept: "application/json",
+    "X-Hermes-Extension-Version": chrome.runtime.getManifest().version,
+  };
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers["Content-Type"] = "application/json";
 
@@ -16,6 +19,7 @@ async function request(path, { method = "GET", token, body } = {}) {
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal,
   });
 
   if (response.status === 401) {
@@ -47,6 +51,18 @@ export async function fetchMe(token) {
 
 export async function logout(token) {
   await request("/api/extension/auth/logout", { method: "POST", token });
+}
+
+const VERSION_CHECK_TIMEOUT_MS = 3000;
+
+// The popup gates on this call before rendering anything, so it must never
+// hang: a slow or unresponsive server should fail open like any other error.
+export async function checkVersion() {
+  const version = encodeURIComponent(chrome.runtime.getManifest().version);
+  const { status, data } = await request(`/api/extension/version?version=${version}`, {
+    signal: AbortSignal.timeout(VERSION_CHECK_TIMEOUT_MS),
+  });
+  return { status, data };
 }
 
 export async function submitProfile(token, url, page = null) {

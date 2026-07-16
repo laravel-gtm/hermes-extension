@@ -4,6 +4,14 @@ This document is the implementation contract between the Hermes Laravel applicat
 
 All `/api/extension/*` requests and responses use JSON except the successful logout response, which has no body. Clients send `Accept: application/json` and, for requests with a body, `Content-Type: application/json`.
 
+Every request the extension makes — authenticated or not, popup or background — also sends:
+
+```http
+X-Hermes-Extension-Version: 1.4.0
+```
+
+This is the version from the installed extension's `manifest.json` (read at runtime via `chrome.runtime.getManifest().version`), not a hardcoded value. The server stamps it onto created capture records (`prospect_requests.extension_version`) and adds it to Laravel Context (`extension.version`) for logging on every request that carries it. Auth, `me`, and logout do not require the header, but `POST /api/extension/profiles` only creates records for supported versions — a missing or unsupported header value turns that write into the HTTP 200 `unsupported_version` no-op described below.
+
 ## Contract summary
 
 | Method | Route | Authentication | Success |
@@ -11,7 +19,8 @@ All `/api/extension/*` requests and responses use JSON except the successful log
 | `GET` | `/extension/auth/start` | Browser session / existing Google SSO flow | Redirect to the extension callback with a one-time code |
 | `POST` | `/api/extension/auth/exchange` | One-time exchange code | `200` with a Sanctum token and user |
 | `GET` | `/api/extension/me` | Sanctum bearer token | `200` with user |
-| `POST` | `/api/extension/profiles` | Sanctum bearer token with `extension:capture` | `201` queued or `200` duplicate |
+| `GET` | `/api/extension/version` | None | `200` always, with supportability |
+| `POST` | `/api/extension/profiles` | Sanctum bearer token with `extension:capture` | `201` queued, `200` duplicate, or `200` unsupported version |
 | `POST` | `/api/extension/auth/logout` | Sanctum bearer token | `204`, current token revoked |
 
 ## Browser authentication flow
@@ -136,6 +145,32 @@ Missing, invalid, expired, or revoked token — `401 Unauthorized`:
 
 The extension treats a `401` from any protected endpoint as signed out and removes its locally stored token.
 
+### `GET /api/extension/version`
+
+Checked by the popup on every open so an unsupported extension build can be blocked before it does anything else.
+
+Authentication: none.
+
+Request:
+
+```http
+GET /api/extension/version?version=1.4.0
+```
+
+`version` is the calling extension's `manifest.json` version, URL-encoded.
+
+Response — always `200 OK`, never an error status for a well-formed request:
+
+```json
+{
+  "supported": true,
+  "minimum_version": "1.4.0",
+  "latest_release_url": "https://github.com/laravel-gtm/hermes-extension/releases/latest"
+}
+```
+
+`supported` is `false` when the calling version is below `minimum_version`, is on the server's explicit blocklist (`HERMES_EXTENSION_BLOCKED_VERSIONS`), or is missing/malformed. The extension treats anything other than an explicit `200` with `supported === false` as "fail open" — network errors, timeouts, non-200 statuses, and malformed bodies all proceed with the normal popup flow rather than blocking the user.
+
 ### `POST /api/extension/profiles`
 
 Submits one normalized LinkedIn profile URL for asynchronous capture.
@@ -191,6 +226,16 @@ Already captured — `200 OK`:
 ```
 
 Duplicate detection uses the normalized URL and must be race-safe, preferably with a database unique constraint plus an insert-or-detect-conflict operation. "Already captured" is application-wide unless Hermes's existing data model requires a tenant scope; if it does, apply that scope consistently without changing this HTTP response.
+
+Unsupported extension version — `200 OK`:
+
+```json
+{
+  "status": "unsupported_version"
+}
+```
+
+Returned instead of creating a capture record when the calling extension's `X-Hermes-Extension-Version` is missing, malformed, below the current minimum, or explicitly blocked. Request validation still runs first (an invalid URL still returns `422`), but no record is created and no capture job is dispatched. The extension treats this the same as an unsupported response from `GET /api/extension/version` — it replaces the popup with the upgrade-only screen — covering the case where the minimum version was raised after the popup already loaded.
 
 Invalid URL — `422 Unprocessable Content`:
 
@@ -418,9 +463,13 @@ use App\Http\Controllers\Extension\ExchangeExtensionCodeController;
 use App\Http\Controllers\Extension\ExtensionProfileController;
 use App\Http\Controllers\Extension\LogoutExtensionController;
 use App\Http\Controllers\Extension\ShowExtensionUserController;
+use App\Http\Controllers\Extension\ShowExtensionVersionController;
 use Illuminate\Support\Facades\Route;
 
 Route::prefix('extension')->group(function () {
+    Route::get('/version', ShowExtensionVersionController::class)
+        ->middleware('throttle:extension-version');
+
     Route::post('/auth/exchange', ExchangeExtensionCodeController::class)
         ->middleware('throttle:extension-auth-exchange');
 
@@ -439,7 +488,8 @@ Controller responsibilities:
 - Existing Google callback/completion action: authenticate/provision the user using current application logic, verify the OAuth state, issue the exchange code only for a valid extension intent, clear that intent, and redirect to the fixed Chromium callback.
 - `ExchangeExtensionCodeController`: validate JSON, atomically consume the code, create the Sanctum token, and serialize the exact success shape.
 - `ShowExtensionUserController`: serialize only `name` and `email` under `user`.
-- `ExtensionProfileController`: validate and normalize the URL, insert idempotently, dispatch capture work only for a new record, and return `201 queued` or `200 duplicate`.
+- `ShowExtensionVersionController`: report `supported` for the queried version (minimum floor + blocklist; missing/malformed → unsupported) plus `minimum_version` and `latest_release_url`, always `200`.
+- `ExtensionProfileController`: validate and normalize the URL; no-op with `200 unsupported_version` when the version header is missing or unsupported; otherwise insert idempotently with the stamped `extension_version`, dispatch capture work only for a new record, and return `201 queued` or `200 duplicate`.
 - `LogoutExtensionController`: delete `currentAccessToken()` and return an empty `204` response.
 
 Use Form Request classes or equivalent validators for exchange and profile payloads. Add feature tests for every response and race-sensitive service-level tests for single-use exchange and duplicate capture behavior.
@@ -454,7 +504,7 @@ chrome-extension://acddngimkgljedjnlbdjnlahoafbchni
 
 The extension has a matching Chrome `host_permissions` entry for `https://hermes.laravel-demo.cloud/*`, so these bearer-token API routes do not use browser cookies, Laravel's SPA authentication flow, or CSRF protection. No wildcard CORS allowance is needed for the popup.
 
-Chrome extension host permissions generally allow the popup to make the cross-origin requests. If the application or its proxy applies a restrictive CORS policy to these API paths, explicitly allow the exact extension origin above for `/api/extension/*`, the methods `GET` and `POST`, and the headers `Authorization`, `Content-Type`, and `Accept`. Do not use `*` together with credentials; credentials are not required for the API calls.
+Chrome extension host permissions generally allow the popup to make the cross-origin requests. If the application or its proxy applies a restrictive CORS policy to these API paths, explicitly allow the exact extension origin above for `/api/extension/*`, the methods `GET` and `POST`, and the headers `Authorization`, `Content-Type`, `Accept`, and `X-Hermes-Extension-Version`. Do not use `*` together with credentials; credentials are not required for the API calls.
 
 Laravel 12's global `HandleCors` middleware handles CORS preflight requests. If a custom CORS rule is needed, publish `config/cors.php` with `php artisan config:publish cors` and scope the rule to these API paths and the exact origin.
 
@@ -467,5 +517,7 @@ Laravel 12's global `HandleCors` middleware handles CORS preflight requests. If 
 - Exchange returns exactly `token` plus `user.name` and `user.email`; invalid, expired, and used codes all return the same `422` code error.
 - `me` returns the exact user shape for a valid token and `401` after revocation.
 - Profile submission canonicalizes accepted LinkedIn URLs, rejects non-profile/lookalike URLs with `422`, queues a new URL with `201`, and returns `200 duplicate` without dispatching a second job.
+- The version endpoint returns `supported: true` for versions at or above the minimum, and `supported: false` for below-minimum, blocked, missing, and malformed versions — always `200`.
+- Profile submission with a missing, below-minimum, or blocked `X-Hermes-Extension-Version` returns `200 unsupported_version`, creates no record, and dispatches no job; a supported version stamps `extension_version` on the created record.
 - A token without `extension:capture` cannot submit a profile.
 - Logout revokes only the current token, returns an empty `204`, and that token subsequently receives `401`.

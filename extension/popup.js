@@ -1,10 +1,13 @@
 import { getSession, setSession, clearSession } from "./js/storage.js";
-import { fetchMe, logout, submitProfile, UnauthorizedError } from "./js/api.js";
+import { fetchMe, logout, submitProfile, checkVersion, UnauthorizedError } from "./js/api.js";
 import { isLinkedInUrl, isLinkedInProfileUrl, normalizeProfileUrl } from "./js/linkedin.js";
 import { collectProfileSignals, parseProfileFromRaw } from "./js/scraper.js";
 
+const FALLBACK_RELEASE_URL = "https://github.com/laravel-gtm/hermes-extension/releases/latest";
+
 const states = {
   loading: document.getElementById("state-loading"),
+  unsupported: document.getElementById("state-unsupported"),
   notLinkedIn: document.getElementById("state-not-linkedin"),
   signedOut: document.getElementById("state-signed-out"),
   noProfile: document.getElementById("state-no-profile"),
@@ -23,6 +26,7 @@ const els = {
   accountEmail2: document.getElementById("account-email-2"),
   profileUrl: document.getElementById("profile-url"),
   feedback: document.getElementById("feedback"),
+  getLatestBtn: document.getElementById("get-latest-btn"),
 };
 
 function showState(name) {
@@ -71,6 +75,32 @@ async function capturePageData(tabId) {
 async function handleUnauthorized() {
   await clearSession();
   showState("signedOut");
+}
+
+function showUnsupported(data) {
+  const releaseUrl = data?.latest_release_url || FALLBACK_RELEASE_URL;
+  els.getLatestBtn.onclick = () => {
+    chrome.tabs.create({ url: releaseUrl });
+    window.close();
+  };
+  showState("unsupported");
+}
+
+// Checked on every popup open. Fails open: any network error, timeout,
+// non-200, or malformed body proceeds with the normal popup flow rather than
+// bricking the popup because the version-check API is unreachable. Only an
+// explicit 200 with supported === false blocks with the upgrade-only screen.
+async function checkAndGateVersion() {
+  try {
+    const { status, data } = await checkVersion();
+    if (status === 200 && data?.supported === false) {
+      showUnsupported(data);
+      return true;
+    }
+  } catch {
+    // Fail open.
+  }
+  return false;
 }
 
 async function render() {
@@ -183,6 +213,10 @@ els.addProfileBtn.addEventListener("click", async () => {
 
     if (status === 201) {
       showFeedback("Profile queued for Hermes.", "success");
+    } else if (status === 200 && data?.status === "unsupported_version") {
+      // The backend bumped the supported floor while the popup was open.
+      showUnsupported(data);
+      return;
     } else if (status === 200) {
       showFeedback("Profile already added.", "duplicate");
     } else if (status === 422) {
@@ -202,4 +236,7 @@ els.addProfileBtn.addEventListener("click", async () => {
   }
 });
 
-render();
+(async () => {
+  const gated = await checkAndGateVersion();
+  if (!gated) render();
+})();
