@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run tests
+        run: npm test
+
+      - name: Verify tag matches manifest version
+        run: |
+          manifest_version="$(python3 -c "import json; print(json.load(open('extension/manifest.json'))['version'])")"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$manifest_version" != "$tag_version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match extension/manifest.json version $manifest_version" >&2
+            echo "Bump the manifest (and re-tag) so the release zip is versioned correctly." >&2
+            exit 1
+          fi
+
+      - name: Build extension zip
+        run: ./scripts/build-zip.sh
+
+      - name: Create GitHub release with zip asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/hermes-extension-$GITHUB_REF_NAME.zip" \
+            --title "Hermes Extension $GITHUB_REF_NAME" \
+            --generate-notes
