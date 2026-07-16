@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "Hermes LinkedIn Capture",
   "version": "1.4.0",
+  "minimum_chrome_version": "103",
   "description": "Send LinkedIn profile URLs to Hermes with one click.",
   "background": {
     "service_worker": "background.js",
