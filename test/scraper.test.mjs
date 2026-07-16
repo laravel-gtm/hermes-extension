@@ -21,6 +21,7 @@ import {
   buildDateRange,
   canonicalCompanyUrl,
   pickMostRecentPosition,
+  collectProfileSignals,
 } from "../extension/js/scraper.js";
 
 // ---------------------------------------------------------------------------
@@ -41,6 +42,7 @@ function voyagerBlob() {
         lastName: "Lovelace",
         headline: "Software Engineer at Foo",
         geoLocationName: "London, England, United Kingdom",
+        "*positions": ["urn:li:fs_position:1", "urn:li:fs_position:2"],
       },
       {
         $type: "com.linkedin.voyager.identity.profile.Position",
@@ -90,6 +92,49 @@ function prodGarbageDom() {
   };
 }
 
+// A bootstrap payload carrying two people at once — e.g. Ada's own profile
+// plus a "people also viewed" recommendation for Bob, each with their own
+// current position. Only Ada's position is reachable from Ada's profile via
+// *profilePositionGroups; Bob's is not referenced by Ada at all.
+function voyagerBlobWithUnrelatedPerson() {
+  return JSON.stringify({
+    included: [
+      {
+        $type: "com.linkedin.voyager.identity.profile.Profile",
+        entityUrn: "urn:li:fs_profile:ada-lovelace",
+        publicIdentifier: "ada-lovelace",
+        firstName: "Ada",
+        lastName: "Lovelace",
+        headline: "Engineer at AdaCo",
+        "*profilePositionGroups": ["urn:li:fs_position:ada-1"],
+      },
+      {
+        $type: "com.linkedin.voyager.identity.profile.Position",
+        entityUrn: "urn:li:fs_position:ada-1",
+        title: "CEO",
+        companyName: "AdaCo",
+        timePeriod: { startDate: { month: 1, year: 2020 } },
+      },
+      {
+        $type: "com.linkedin.voyager.identity.profile.Profile",
+        entityUrn: "urn:li:fs_profile:bob",
+        publicIdentifier: "bob",
+        firstName: "Bob",
+        lastName: "Recommended",
+      },
+      {
+        $type: "com.linkedin.voyager.identity.profile.Position",
+        entityUrn: "urn:li:fs_position:bob-1",
+        title: "CEO",
+        companyName: "BobCo",
+        // Later start date than Ada's — would win a global scan across all
+        // Position models in the blob if positions weren't URN-scoped.
+        timePeriod: { startDate: { month: 1, year: 2026 } },
+      },
+    ],
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Voyager extraction
 // ---------------------------------------------------------------------------
@@ -116,6 +161,124 @@ test("parseVoyagerModels picks the current role over an older completed one", ()
 test("parseVoyagerModels returns {} when no models are present", () => {
   assert.deepEqual(parseVoyagerModels(["not json"], null), {});
   assert.deepEqual(parseVoyagerModels([], null), {});
+});
+
+// ---------------------------------------------------------------------------
+// Stale/wrong-person Voyager blobs (SPA navigation leaves the old bootstrap
+// JSON in the DOM) must never be treated as authoritative for the new page.
+// ---------------------------------------------------------------------------
+
+test("parseVoyagerModels returns nothing when the slug matches nobody in the blob", () => {
+  // The blob only describes ada-lovelace; the page has since navigated to a
+  // different person entirely. No profile, no position — not Ada's.
+  const out = parseVoyagerModels([voyagerBlob()], "brand-new-person");
+  assert.deepEqual(out, {});
+});
+
+test("parseProfileFromRaw lets fresh DOM text correct a stale Voyager blob", () => {
+  const raw = {
+    slug: "brand-new-person",
+    voyager: [voyagerBlob()], // stale: still describes ada-lovelace
+    topCard: {
+      h1Text: "New Person",
+      leafTexts: ["New Person", "Founder at NewCo"],
+    },
+    experience: { boldTexts: [], companyAnchorText: null, companyHref: null },
+  };
+  const payload = parseProfileFromRaw(raw);
+  assert.equal(payload.fullName, "New Person");
+  assert.notEqual(payload.fullName, "Ada Lovelace");
+});
+
+test("parseVoyagerModels never attributes another profile's position to the selected one", () => {
+  const out = parseVoyagerModels([voyagerBlobWithUnrelatedPerson()], "ada-lovelace");
+  assert.equal(out.fullName, "Ada Lovelace");
+  assert.ok(out.mostRecentPosition);
+  assert.equal(out.mostRecentPosition.companyName, "AdaCo");
+  assert.notEqual(out.mostRecentPosition.companyName, "BobCo");
+});
+
+test("a missing or empty timePeriod is treated as unknown, never current", () => {
+  for (const timePeriod of [undefined, {}]) {
+    const blob = JSON.stringify({
+      included: [
+        {
+          $type: "com.linkedin.voyager.identity.profile.Profile",
+          entityUrn: "urn:li:fs_profile:x",
+          publicIdentifier: "x",
+          firstName: "X",
+          lastName: "Y",
+          "*profilePositionGroups": ["urn:li:fs_position:1"],
+        },
+        {
+          $type: "com.linkedin.voyager.identity.profile.Position",
+          entityUrn: "urn:li:fs_position:1",
+          title: "Advisor",
+          companyName: "SomeCo",
+          ...(timePeriod === undefined ? {} : { timePeriod }),
+        },
+      ],
+    });
+    const out = parseVoyagerModels([blob], "x");
+    assert.ok(out.mostRecentPosition);
+    assert.equal(out.mostRecentPosition.isCurrent, false);
+    assert.equal(out.mostRecentPosition.dateRange, null);
+  }
+});
+
+test("a lone MiniProfile never claims an unlinked position from the blob", () => {
+  const blob = JSON.stringify({
+    included: [
+      {
+        $type: "com.linkedin.voyager.identity.profile.MiniProfile",
+        entityUrn: "urn:li:fs_miniProfile:target",
+        publicIdentifier: "target",
+        firstName: "Target",
+        lastName: "Person",
+      },
+      {
+        $type: "com.linkedin.voyager.identity.profile.Position",
+        entityUrn: "urn:li:fs_position:wrong",
+        title: "CEO",
+        companyName: "WrongCo",
+        timePeriod: { startDate: { year: 2026 } },
+      },
+    ],
+  });
+
+  const out = parseVoyagerModels([blob], "target");
+  assert.equal(out.fullName, "Target Person");
+  assert.equal(out.mostRecentPosition, undefined);
+});
+
+test("parseVoyagerModels resolves companyName from the referenced company model when missing inline", () => {
+  const blob = JSON.stringify({
+    included: [
+      {
+        $type: "com.linkedin.voyager.identity.profile.Profile",
+        entityUrn: "urn:li:fs_profile:x",
+        publicIdentifier: "x",
+        firstName: "X",
+        lastName: "Y",
+        "*profilePositionGroups": ["urn:li:fs_position:1"],
+      },
+      {
+        $type: "com.linkedin.voyager.identity.profile.Position",
+        entityUrn: "urn:li:fs_position:1",
+        title: "CTO",
+        companyUrn: "urn:li:fs_company:1", // no inline companyName
+        timePeriod: { startDate: { month: 1, year: 2026 } },
+      },
+      {
+        $type: "com.linkedin.voyager.entities.shared.MiniCompany",
+        entityUrn: "urn:li:fs_company:1",
+        name: "Resolved Co",
+        universalName: "resolvedco",
+      },
+    ],
+  });
+  const out = parseVoyagerModels([blob], "x");
+  assert.equal(out.mostRecentPosition.companyName, "Resolved Co");
 });
 
 // ---------------------------------------------------------------------------
@@ -189,6 +352,73 @@ test("DOM top card picks headline then location, skipping noise", () => {
   assert.equal(payload.location, "London, England, United Kingdom");
 });
 
+test("a missing headline never promotes the location leaf into the headline slot", () => {
+  const raw = {
+    slug: "ada",
+    voyager: [],
+    topCard: {
+      h1Text: "Ada Lovelace",
+      leafTexts: ["Ada Lovelace", "San Francisco Bay Area", "500+ connections"],
+    },
+    experience: { boldTexts: [], companyAnchorText: null, companyHref: null },
+  };
+  const payload = parseProfileFromRaw(raw);
+  assert.equal(payload.headline, null);
+  assert.equal(payload.location, "San Francisco Bay Area");
+});
+
+test("pickDomPosition never derives dateRange/isCurrent from a bare four-digit title", () => {
+  const raw = {
+    slug: "x",
+    voyager: [],
+    topCard: { h1Text: null, leafTexts: [] },
+    experience: {
+      boldTexts: ["Summer 2024 Intern", "Acme", "May 2024 - Aug 2024 · 4 mos"],
+      companyAnchorText: "Acme",
+      companyHref: null,
+    },
+  };
+  const pos = parseProfileFromRaw(raw).mostRecentPosition;
+  assert.equal(pos.title, "Summer 2024 Intern");
+  assert.equal(pos.dateRange, "May 2024 - Aug 2024 · 4 mos");
+  assert.equal(pos.isCurrent, false); // a completed internship, not ongoing
+});
+
+test("pickDomPosition leaves dateRange null when nothing matches date-range grammar", () => {
+  const raw = {
+    slug: "x",
+    voyager: [],
+    topCard: { h1Text: null, leafTexts: [] },
+    experience: {
+      boldTexts: ["Co-Founder, Techstars 2024", "Techstars"],
+      companyAnchorText: "Techstars",
+      companyHref: null,
+    },
+  };
+  const pos = parseProfileFromRaw(raw).mostRecentPosition;
+  assert.equal(pos.title, "Co-Founder, Techstars 2024");
+  assert.equal(pos.dateRange, null);
+  assert.equal(pos.isCurrent, false);
+});
+
+test("a year-dash title is preserved and never treated as a date range", () => {
+  const raw = {
+    slug: "x",
+    voyager: [],
+    topCard: { h1Text: null, leafTexts: [] },
+    experience: {
+      boldTexts: ["Summer 2024 - Intern", "Acme"],
+      companyAnchorText: "Acme",
+      companyHref: null,
+    },
+  };
+
+  const pos = parseProfileFromRaw(raw).mostRecentPosition;
+  assert.equal(pos.title, "Summer 2024 - Intern");
+  assert.equal(pos.dateRange, null);
+  assert.equal(pos.isCurrent, false);
+});
+
 // ---------------------------------------------------------------------------
 // Empty / defensive
 // ---------------------------------------------------------------------------
@@ -226,7 +456,6 @@ test("payload always keeps the exact contract shape", () => {
 test("looksLikeDateRange flags date/tenure fragments", () => {
   for (const t of [
     "Feb 2026 - Jun 2026 · 5 mos",
-    "Feb 2026 -",
     "2020 - 2022",
     "Jan 2020 – Present",
     "ene 2024 - actualidad",
@@ -235,9 +464,27 @@ test("looksLikeDateRange flags date/tenure fragments", () => {
   ]) {
     assert.equal(looksLikeDateRange(t), true, `expected date-like: ${t}`);
   }
-  for (const t of ["Acme Corp", "VP, Marketing", "2020 Companies", "3M", "1-800-Flowers"]) {
+  for (const t of [
+    "Acme Corp",
+    "VP, Marketing",
+    "Feb 2026 -",
+    "2020 Companies",
+    "3M",
+    "1-800-Flowers",
+  ]) {
     assert.equal(looksLikeDateRange(t), false, `expected NOT date-like: ${t}`);
   }
+});
+
+test("looksLikeDateRange requires the year to participate in a real date-range pattern", () => {
+  // The hyphen belongs to "Co-Founder" and has nothing to do with the year —
+  // this must not be flagged just because both happen to appear somewhere.
+  assert.equal(looksLikeDateRange("Co-Founder, Techstars 2024"), false);
+  assert.equal(looksLikeDateRange("Ex-Google, Ex-Facebook (2015-2020)"), true); // a real range still matches
+});
+
+test("sanitizeTitle keeps a valid title with an unrelated hyphen and a year", () => {
+  assert.equal(sanitizeTitle("Co-Founder, Techstars 2024"), "Co-Founder, Techstars 2024");
 });
 
 test("sanitizeCompanyName strips employment type and rejects date blobs", () => {
@@ -321,4 +568,129 @@ test("mergeProfile prefers primary, fills gaps from fallback", () => {
   assert.equal(merged.headline, "Engineer");
   assert.equal(merged.location, "London");
   assert.equal(merged.mostRecentPosition.companyName, "Foo");
+});
+
+test("mergeProfile never stitches a Voyager field onto a different DOM role", () => {
+  // Voyager's latest-start side role has no companyName; the DOM's top entry
+  // is a completely different main role at MainCo. The two must never blend.
+  const primary = {
+    mostRecentPosition: {
+      title: "Side-job CTO",
+      companyName: null,
+      companyUrl: null,
+      isCurrent: true,
+      dateRange: "Jan 2026 - Present",
+    },
+  };
+  const fallback = {
+    mostRecentPosition: {
+      title: "Chief Engineer",
+      companyName: "MainCo",
+      companyUrl: "https://www.linkedin.com/company/mainco",
+      isCurrent: true,
+      dateRange: "Jan 2020 - Present",
+    },
+  };
+  const merged = mergeProfile(primary, fallback).mostRecentPosition;
+  assert.equal(merged.title, "Side-job CTO");
+  assert.equal(merged.companyName, null); // never borrowed from the unrelated DOM role
+  assert.equal(merged.companyUrl, null);
+  assert.equal(merged.dateRange, "Jan 2026 - Present");
+});
+
+test("mergePosition falls back to the whole DOM position only when Voyager gave none", () => {
+  const fallback = {
+    title: "Chief Engineer",
+    companyName: "MainCo",
+    companyUrl: "https://www.linkedin.com/company/mainco",
+    isCurrent: true,
+    dateRange: "Jan 2020 - Present",
+  };
+  const merged = mergeProfile({}, { mostRecentPosition: fallback }).mostRecentPosition;
+  assert.deepEqual(merged, fallback);
+});
+
+// ---------------------------------------------------------------------------
+// collectProfileSignals must survive the executeScript serialization
+// boundary: Chrome calls .toString() on it and re-parses it in the page's
+// isolated world, so it cannot close over anything in this module's scope.
+// ---------------------------------------------------------------------------
+
+test("collectProfileSignals stays self-contained across the executeScript serialization boundary", async () => {
+  const source = collectProfileSignals.toString();
+  // Reconstruct it exactly the way Chrome does: from its source text alone,
+  // detached from every binding in this file. Any accidental reference to
+  // outer module scope (a helper, an import) would throw here.
+  const rebuilt = new Function(`return (${source});`)();
+
+  const stubDocument = {
+    querySelectorAll: () => [],
+    querySelector: () => null,
+    getElementById: () => null,
+  };
+  const stubWindow = { location: { pathname: "/in/ada-lovelace" } };
+
+  const originalWindow = globalThis.window;
+  const originalDocument = globalThis.document;
+  const originalSetTimeout = globalThis.setTimeout;
+  globalThis.window = stubWindow;
+  globalThis.document = stubDocument;
+  globalThis.setTimeout = (fn) => {
+    fn();
+    return 0;
+  };
+
+  try {
+    const result = await rebuilt();
+    assert.equal(result.slug, "ada-lovelace");
+    assert.deepEqual(result.voyager, []);
+    assert.deepEqual(result.topCard, { h1Text: null, leafTexts: [] });
+    assert.deepEqual(result.experience, { boldTexts: [], companyAnchorText: null, companyHref: null });
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+test("collectProfileSignals keeps waiting when stale JSON only mentions the current slug", async () => {
+  const rebuilt = new Function(`return (${collectProfileSignals.toString()});`)();
+  const staleBlob = JSON.stringify({
+    included: [
+      {
+        $type: "com.linkedin.voyager.identity.profile.Profile",
+        publicIdentifier: "old-person",
+        firstName: "Old",
+        lastName: "Person",
+        trackingNote: "recommendation-for-new-person",
+      },
+    ],
+  });
+
+  const originalWindow = globalThis.window;
+  const originalDocument = globalThis.document;
+  const originalSetTimeout = globalThis.setTimeout;
+  let waits = 0;
+  globalThis.window = { location: { pathname: "/in/new-person" } };
+  globalThis.document = {
+    querySelectorAll: (selector) =>
+      selector === 'code, script[type="application/json"]' ? [{ textContent: staleBlob }] : [],
+    querySelector: () => null,
+    getElementById: () => null,
+  };
+  globalThis.setTimeout = (fn) => {
+    waits += 1;
+    fn();
+    return 0;
+  };
+
+  try {
+    const result = await rebuilt();
+    assert.equal(waits, 16);
+    assert.equal(result.slug, "new-person");
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
+    globalThis.setTimeout = originalSetTimeout;
+  }
 });

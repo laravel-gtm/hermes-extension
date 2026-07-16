@@ -168,13 +168,24 @@ export async function collectProfileSignals() {
 
   // Consider the page ready once the top card has painted, or once bootstrap
   // JSON carrying a member name is present. The capture button can fire before
-  // either is true on a cold/slow load, so poll briefly.
+  // either is true on a cold/slow load, so poll briefly. On an SPA navigation
+  // the *previous* person's bootstrap JSON can still be sitting in the DOM —
+  // only treat that JSON as signalling hydration when it actually mentions the
+  // slug we're currently on, so a stale blob doesn't stop the wait early and
+  // get treated as authoritative for the new page.
   const hydrated = () => {
     if (topCardH1()) return true;
     try {
+      const slug = profileSlug();
+      const escapedSlug = slug && slug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const publicIdentifier = escapedSlug
+        ? new RegExp(`"publicIdentifier"\\s*:\\s*"${escapedSlug}"`, "i")
+        : null;
       const nodes = document.querySelectorAll('code, script[type="application/json"]');
       for (const node of nodes) {
-        if ((node.textContent || "").includes('"firstName"')) return true;
+        const text = node.textContent || "";
+        if (!text.includes('"firstName"')) continue;
+        if (!slug || publicIdentifier.test(text)) return true;
       }
     } catch {
       // ignore
@@ -216,13 +227,26 @@ export function cleanText(value) {
 export function looksLikeDateRange(text) {
   if (!text) return false;
   const t = String(text);
+  const month =
+    "(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?|ene(?:ro)?)\\.?";
+  const endpoint = `(?:${month}\\s+)?\\d{4}`;
+  const present = "(?:present|current|actualidad|heute|aujourd|至今)";
+  const range = new RegExp(
+    `${endpoint}\\s*[-–—]\\s*(?:${endpoint}|${present})(?![A-Za-zÀ-ÿ])`,
+    "iu",
+  );
+  const ongoing = new RegExp(`${endpoint}\\s+${present}(?![A-Za-zÀ-ÿ])`, "iu");
+
   return (
-    // "2020 - 2022", "2020 – Present", "ene 2024 - actualidad"
-    (/\b\d{4}\b/.test(t) && /[-–—]|present|current|actualidad|heute|aujourd|至今/i.test(t)) ||
+    // A dash is only date syntax when it joins two valid endpoints. A year and
+    // an unrelated hyphen in a title ("Summer 2024 - Intern") are not enough.
+    range.test(t) ||
+    // Preserve localized ongoing ranges that omit the dash ("2024 actualidad").
+    ongoing.test(t) ||
     // "· 5 mos", "· 3 yrs", localised month/year unit after a bullet
     /·\s*\d+\s*(mo|mos|month|months|yr|yrs|year|years|an|ans|mois|año|años|ano|anos)\b/i.test(t) ||
-    // "Feb 2026 -", "Jan 2020 –"
-    /^[A-Za-zÀ-ÿ.]{3,}\s+\d{4}\s*[-–—]/.test(t) ||
+    // A bare "Present" with no adjoining year is still an unambiguous
+    // ongoing-role marker.
     /\bpresent\b/i.test(t)
   );
 }
@@ -369,22 +393,32 @@ function indexByUrn(models) {
   return byUrn;
 }
 
+function isProfileModelType(type) {
+  return typeof type === "string" && /(^|\.)(Mini)?Profile$/.test(type);
+}
+
+// A SPA navigation can leave the previous person's bootstrap JSON sitting in
+// the DOM. When we know which profile we're looking at (the URL slug), a
+// blob that doesn't contain a matching publicIdentifier is not evidence about
+// the current page at all — returning no profile (rather than guessing at
+// any full Profile/MiniProfile present) is what lets the DOM fallback speak
+// for the page actually being viewed instead of a stale, unrelated person.
 function pickProfile(models, slug) {
   const profiles = models.filter(
-    (m) =>
-      typeof m.$type === "string" &&
-      /(^|\.)(Mini)?Profile$/.test(m.$type) &&
-      (m.firstName || m.lastName),
+    (m) => isProfileModelType(m.$type) && (m.firstName || m.lastName),
   );
   if (!profiles.length) return null;
 
   if (slug) {
-    const bySlug = profiles.find(
-      (p) => (p.publicIdentifier || "").toLowerCase() === slug.toLowerCase(),
+    return (
+      profiles.find(
+        (p) => (p.publicIdentifier || "").toLowerCase() === slug.toLowerCase(),
+      ) || null
     );
-    if (bySlug) return bySlug;
   }
-  // Prefer a full Profile carrying a headline over a MiniProfile.
+
+  // No slug to check against (e.g. not on a /in/ page) — prefer a full
+  // Profile carrying a headline over a MiniProfile.
   return (
     profiles.find((p) => p.$type.endsWith(".Profile") && p.headline != null) ||
     profiles.find((p) => p.$type.endsWith(".Profile")) ||
@@ -414,9 +448,14 @@ function resolveGeoLocation(profile, byUrn) {
   return null;
 }
 
-function resolveCompanyUrl(position, byUrn) {
+function resolveCompanyModel(position, byUrn) {
   const ref = position["*company"] || position.companyUrn || position["*companyUrn"];
   const model = typeof ref === "string" ? byUrn.get(ref) : null;
+  return { ref, model };
+}
+
+function resolveCompanyUrl(position, byUrn) {
+  const { ref, model } = resolveCompanyModel(position, byUrn);
   const candidates = [model, position.company, position.companyResolutionResult].filter(Boolean);
   for (const candidate of candidates) {
     if (typeof candidate.url === "string") {
@@ -436,21 +475,118 @@ function resolveCompanyUrl(position, byUrn) {
   return null;
 }
 
-function collectPositions(models, byUrn) {
-  return models
-    .filter(
+// A Position often carries only a *company URN with no inline companyName;
+// the referenced MiniCompany model (already sitting in the same blob) is the
+// authoritative source for the name in that case.
+function resolveCompanyName(position, byUrn) {
+  const { model } = resolveCompanyModel(position, byUrn);
+  const candidates = [model, position.company, position.companyResolutionResult].filter(Boolean);
+  for (const candidate of candidates) {
+    const raw =
+      candidate.name ||
+      (candidate.defaultLocalizedName && candidate.defaultLocalizedName.value) ||
+      candidate.defaultLocalizedName;
+    if (typeof raw === "string" && raw.trim()) return raw;
+  }
+  return null;
+}
+
+function isPositionModelType(type) {
+  return typeof type === "string" && /Position$/.test(type);
+}
+
+// Voyager reference containers show up either as a bare array of URNs/embedded
+// objects, or as a paged `{ "*elements": [...] }` / `{ elements: [...] }`
+// wrapper. Normalise both shapes to a plain array of refs.
+function asRefList(value) {
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === "object") {
+    if (Array.isArray(value["*elements"])) return value["*elements"];
+    if (Array.isArray(value.elements)) return value.elements;
+  }
+  return null;
+}
+
+const POSITION_CONTAINER_FIELDS = [
+  "*profilePositionGroups",
+  "profilePositionGroups",
+  "*positionGroupView",
+  "positionGroupView",
+  "*positionView",
+  "positionView",
+  "*positions",
+  "positions",
+];
+
+// Walk from a profile's position-reference fields (view/group/element URNs)
+// down to the concrete Position models they point at. Bounded in depth and
+// deduplicated by entityUrn so a cyclical or pathological payload can't hang.
+function walkPositionRefs(value, byUrn, depth, visited, out) {
+  if (value == null || depth > 6) return;
+  const list = asRefList(value);
+  if (list) {
+    for (const item of list) walkPositionRefs(item, byUrn, depth + 1, visited, out);
+    return;
+  }
+  const model = typeof value === "string" ? byUrn.get(value) : value;
+  if (!model || typeof model !== "object") return;
+  const urn = model.entityUrn;
+  if (urn) {
+    if (visited.has(urn)) return;
+    visited.add(urn);
+  }
+  if (isPositionModelType(model.$type)) {
+    out.push(model);
+    return;
+  }
+  for (const field of POSITION_CONTAINER_FIELDS) {
+    if (field in model) walkPositionRefs(model[field], byUrn, depth + 1, visited, out);
+  }
+}
+
+// Only positions reachable from the selected profile's own position
+// view/group/element references count as this person's positions — a
+// bootstrap payload can carry stale models, "people also viewed" profiles, or
+// other unrelated Position entities alongside the real one.
+function reachablePositionModels(profile, models, byUrn) {
+  const out = [];
+  const visited = new Set();
+  for (const field of POSITION_CONTAINER_FIELDS) {
+    if (field in profile) walkPositionRefs(profile[field], byUrn, 0, visited, out);
+  }
+  if (out.length) return out;
+
+  if (profile.entityUrn) {
+    const byBacklink = models.filter(
       (m) =>
-        typeof m.$type === "string" &&
-        /Position$/.test(m.$type) &&
-        (m.title || m.companyName),
-    )
+        isPositionModelType(m.$type) &&
+        (m["*profile"] === profile.entityUrn || m.profileUrn === profile.entityUrn),
+    );
+    if (byBacklink.length) return byBacklink;
+  }
+
+  // No linkage in either direction means no trustworthy attribution. Even a
+  // blob with one named profile can contain unrelated Position models without
+  // their corresponding Profile models, so let the DOM fallback speak.
+  return [];
+}
+
+function collectPositions(positionModels, byUrn) {
+  return positionModels
+    .filter((m) => m.title || m.companyName)
     .map((position) => {
       const period = position.timePeriod || position.dateRange || {};
+      const start = period.startDate || period.start || null;
+      const end = period.endDate || period.end || null;
+      const hasStart = !!(start && start.year);
+      const hasEnd = !!(end && end.year);
       return {
         title: position.title,
-        companyName: position.companyName,
-        start: period.startDate || period.start || null,
-        end: period.endDate || period.end || null,
+        companyName: position.companyName || resolveCompanyName(position, byUrn),
+        start: hasStart ? start : null,
+        end: hasEnd ? end : null,
+        hasTimePeriod: hasStart || hasEnd,
+        hasStart,
         companyUrl: resolveCompanyUrl(position, byUrn),
       };
     });
@@ -463,7 +599,11 @@ export function pickMostRecentPosition(positions) {
     if (!start || !start.year) return -1;
     return start.year * 12 + (start.month || 0);
   };
-  const current = positions.filter((p) => !p.end || !p.end.year);
+  // A position lacking timePeriod entirely is unknown, not current — only a
+  // position we positively know has no end date belongs in the current pool.
+  const current = positions.filter(
+    (p) => (p.hasStart ?? !!(p.start && p.start.year)) && (!p.end || !p.end.year),
+  );
   const pool = current.length ? current : positions;
   let best = pool[0];
   for (const position of pool) {
@@ -483,25 +623,30 @@ export function parseVoyagerModels(blobs, slug) {
   const byUrn = indexByUrn(models);
 
   const profile = pickProfile(models, slug);
-  if (profile) {
-    const name = [cleanText(profile.firstName), cleanText(profile.lastName)]
-      .filter(Boolean)
-      .join(" ");
-    out.fullName = sanitizeName(name);
-    out.headline = sanitizeHeadline(profile.headline || profile.occupation);
-    out.location =
-      sanitizeLocation(profile.geoLocationName || profile.locationName) ||
-      resolveGeoLocation(profile, byUrn);
-  }
+  // No confident match for the page we're actually on (e.g. a stale blob left
+  // over from an SPA navigation) — stay completely silent rather than borrow
+  // a name or position from unrelated JSON, and let the DOM fallback speak
+  // for the current page instead.
+  if (!profile) return out;
 
-  const best = pickMostRecentPosition(collectPositions(models, byUrn));
+  const name = [cleanText(profile.firstName), cleanText(profile.lastName)]
+    .filter(Boolean)
+    .join(" ");
+  out.fullName = sanitizeName(name);
+  out.headline = sanitizeHeadline(profile.headline || profile.occupation);
+  out.location =
+    sanitizeLocation(profile.geoLocationName || profile.locationName) ||
+    resolveGeoLocation(profile, byUrn);
+
+  const positions = collectPositions(reachablePositionModels(profile, models, byUrn), byUrn);
+  const best = pickMostRecentPosition(positions);
   if (best) {
     const title = sanitizeTitle(best.title);
     out.mostRecentPosition = {
       title,
       companyName: sanitizeCompanyName(best.companyName, best.title),
       companyUrl: best.companyUrl || null,
-      isCurrent: !best.end || !best.end.year,
+      isCurrent: best.hasStart === true && (!best.end || !best.end.year),
       dateRange: buildDateRange(best.start, best.end),
     };
   }
@@ -526,6 +671,24 @@ function isNoiseText(text, fullName) {
   );
 }
 
+// Headlines describe a role ("Software Engineer at Foo", "Founder, Acme") and
+// almost always carry a role/company marker; genuine locations don't. Used to
+// stop a lone location leaf from being promoted into the headline slot when
+// the headline itself is simply absent.
+const HEADLINE_MARKERS =
+  /[@|]|\bat\b|\bfounder\b|\bceo\b|\bcto\b|\bcoo\b|\bvp\b|\bfreelance\b|\bengineer\b|\bdirector\b|\bmanager\b|\bpresident\b|\bconsultant\b|\bdeveloper\b|\bdesigner\b|\banalyst\b|\bspecialist\b|\bintern\b|\bstudent\b|\bowner\b|\blead\b|\bhead of\b/i;
+
+function looksLikeLocationCandidate(text) {
+  if (!text) return false;
+  if (HEADLINE_MARKERS.test(text)) return false;
+  if (/\barea$/i.test(text)) return true;
+  const parts = text.split(",").map((p) => p.trim()).filter(Boolean);
+  if (parts.length < 2 || parts.length > 4) return false;
+  return parts.every(
+    (part) => part.length <= 40 && /^[A-ZÀ-Ý][A-Za-zÀ-ÿ'.-]*(\s+[A-Za-zÀ-ÿ0-9'.-]+)*$/.test(part),
+  );
+}
+
 function pickHeadlineAndLocation(leafTexts, fullName) {
   const seen = new Set();
   const candidates = [];
@@ -535,9 +698,21 @@ function pickHeadlineAndLocation(leafTexts, fullName) {
     seen.add(text);
     candidates.push(text);
   }
+  if (!candidates.length) return { headline: null, location: null };
+
+  const [first, second] = candidates;
+
+  // The top card normally orders leaves as headline then location. When the
+  // headline is missing, the leading (or only) leaf is the location itself —
+  // detect that with a location-shaped discriminator instead of trusting
+  // position, so a lone location is never promoted into the headline slot.
+  if (looksLikeLocationCandidate(first) && !looksLikeLocationCandidate(second)) {
+    return { headline: null, location: sanitizeLocation(first) };
+  }
+
   return {
-    headline: sanitizeHeadline(candidates[0]),
-    location: sanitizeLocation(candidates[1]),
+    headline: sanitizeHeadline(first),
+    location: sanitizeLocation(second),
   };
 }
 
@@ -548,8 +723,11 @@ function pickDomPosition(experience) {
   let companyName = sanitizeCompanyName(experience.companyAnchorText, title);
   if (!companyName) companyName = sanitizeCompanyName(bold[1], title);
 
-  const dateCandidate = bold.find((t) => /\d{4}/.test(t) || /present/i.test(t));
-  const dateRange = cleanText(dateCandidate);
+  // Only a candidate that actually matches a date-range/tenure grammar counts
+  // — a bare four-digit substring (e.g. inside a title like "Summer 2024
+  // Intern") must never be picked up as the role's dates.
+  const dateCandidate = bold.find((t) => looksLikeDateRange(t));
+  const dateRange = dateCandidate ? cleanText(dateCandidate) : null;
   const companyUrl = canonicalCompanyUrl(experience.companyHref);
 
   if (!title && !companyName && !dateRange && !companyUrl) return null;
@@ -588,24 +766,29 @@ function preferred(primary, fallback) {
   return fallback != null ? fallback : null;
 }
 
+function wholePosition(position) {
+  return {
+    title: position.title ?? null,
+    companyName: position.companyName ?? null,
+    companyUrl: position.companyUrl ?? null,
+    isCurrent: !!position.isCurrent,
+    dateRange: position.dateRange ?? null,
+  };
+}
+
+// Voyager and the DOM can each only describe one whole role at a time — never
+// stitch a title from one source onto a company/date from the other, since
+// they may legitimately describe two different positions (e.g. Voyager's
+// latest-start side role vs. the DOM's top-rendered main role). Only fall
+// back to the DOM position when Voyager gave no position at all.
 function mergePosition(primary, fallback) {
-  const p = primary || {};
-  const f = fallback || {};
-  const hasPrimary = primary && (p.title || p.companyName || p.companyUrl || p.dateRange);
-  const hasFallback = fallback && (f.title || f.companyName || f.companyUrl || f.dateRange);
-  if (!hasPrimary && !hasFallback) return null;
-
-  const title = preferred(p.title, f.title);
-  const companyName = preferred(p.companyName, f.companyName);
-  const companyUrl = preferred(p.companyUrl, f.companyUrl);
-  const dateRange = preferred(p.dateRange, f.dateRange);
-
-  let isCurrent;
-  if (hasPrimary && typeof p.isCurrent === "boolean") isCurrent = p.isCurrent;
-  else if (hasFallback && typeof f.isCurrent === "boolean") isCurrent = f.isCurrent;
-  else isCurrent = deriveIsCurrent(dateRange);
-
-  return { title, companyName, companyUrl, isCurrent: !!isCurrent, dateRange };
+  if (primary && (primary.title || primary.companyName || primary.companyUrl || primary.dateRange)) {
+    return wholePosition(primary);
+  }
+  if (fallback && (fallback.title || fallback.companyName || fallback.companyUrl || fallback.dateRange)) {
+    return wholePosition(fallback);
+  }
+  return null;
 }
 
 export function mergeProfile(primary, fallback) {
