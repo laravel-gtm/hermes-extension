@@ -65,11 +65,32 @@ export async function checkVersion() {
   return { status, data };
 }
 
-export async function submitProfile(token, url, page = null) {
+// Ask the API for a one-time signed URL to upload a screenshot frame to
+// object storage. Returns { key, url, headers } or null.
+export async function createScreenshotUpload(token) {
+  const { status, data } = await request("/api/extension/screenshots", {
+    method: "POST",
+    token,
+  });
+  return status === 201 && data?.url && data?.key ? data : null;
+}
+
+// PUT one JPEG frame straight to object storage via the signed URL — the
+// image bytes never pass through the Hermes app.
+export async function uploadScreenshot(url, headers, blob) {
+  const response = await fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "image/jpeg", ...(headers || {}) },
+    body: blob,
+  });
+  return response.ok;
+}
+
+export async function submitProfile(token, url, page = null, screenshots = null) {
   const { status, data } = await request("/api/extension/profiles", {
     method: "POST",
     token,
-    body: { url, page },
+    body: { url, page, screenshots },
   });
   return { status, data };
 }

@@ -1,3 +1,76 @@
+/* Hermes brand theme — see hermes/.ai/guidelines/frontend-brand.md.
+   Hex values are precomputed from the brand's OKLCH palette because the
+   manifest supports Chrome 103, which predates oklch() in CSS. */
+
+@font-face {
+  font-family: "Space Grotesk";
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  src: url("fonts/space-grotesk-400.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Space Grotesk";
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+  src: url("fonts/space-grotesk-500.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Space Grotesk";
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+  src: url("fonts/space-grotesk-700.woff2") format("woff2");
+}
+
+:root {
+  color-scheme: light dark;
+
+  /* Light: Paper page, Ink text, Slate secondary, Coral actions. */
+  --bg: #f3f5f9;
+  --surface: #fdfdff;
+  --text: #1d222b;
+  --muted: #5e636f;
+  --border: #dbdee5;
+  --primary: #c53637;
+  --primary-hover: #b32228;
+  --primary-disabled: #e2a4a4;
+  --on-primary: #ffffff;
+  --link: #3275b4;
+  --success: #008856;
+  --success-tint: rgba(0, 136, 86, 0.1);
+  --warning: #b07100;
+  --warning-tint: rgba(176, 113, 0, 0.12);
+  --danger: #bd093f;
+  --danger-tint: rgba(189, 9, 63, 0.09);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Dark: deep Ink surfaces (never pure black), off-white text,
+       Coral-bright actions with near-black text for contrast. */
+    --bg: #0e1218;
+    --surface: #171b22;
+    --text: #e5e8ed;
+    --muted: #989fab;
+    --border: #272b35;
+    --primary: #ed5350;
+    --primary-hover: #ff645f;
+    --primary-disabled: #6e3a3c;
+    --on-primary: #070b14;
+    --link: #67aaed;
+    --success: #2fc183;
+    --success-tint: rgba(47, 193, 131, 0.14);
+    --warning: #e6ac3d;
+    --warning-tint: rgba(230, 172, 61, 0.14);
+    --danger: #f9667a;
+    --danger-tint: rgba(249, 102, 122, 0.14);
+  }
+}
+
 * {
   box-sizing: border-box;
 }
@@ -5,10 +78,16 @@
 body {
   margin: 0;
   width: 300px;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-family:
+    "Space Grotesk",
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    Roboto,
+    sans-serif;
   font-size: 14px;
-  color: #1a1a1a;
-  background: #ffffff;
+  color: var(--text);
+  background: var(--bg);
 }
 
 .header {
@@ -16,7 +95,7 @@ body {
   align-items: center;
   gap: 8px;
   padding: 12px 16px;
-  border-bottom: 1px solid #eee;
+  border-bottom: 1px solid var(--border);
 }
 
 .logo {
@@ -26,7 +105,7 @@ body {
 }
 
 .title {
-  font-weight: 600;
+  font-weight: 700;
   font-size: 15px;
 }
 
@@ -49,17 +128,17 @@ body {
 .text {
   margin: 0;
   line-height: 1.4;
-  color: #333;
+  color: var(--text);
 }
 
 .hint {
-  color: #666;
+  color: var(--muted);
   font-size: 13px;
 }
 
 .profile-url {
   font-size: 12px;
-  color: #0a66c2;
+  color: var(--link);
   word-break: break-all;
 }
 
@@ -70,44 +149,104 @@ body {
 }
 
 .account-name {
-  font-weight: 600;
+  font-weight: 500;
 }
 
 .account-email {
   font-size: 12px;
-  color: #666;
+  color: var(--muted);
 }
 
 .btn {
   border: none;
   border-radius: 6px;
   padding: 10px 14px;
+  font-family: inherit;
   font-size: 14px;
   font-weight: 500;
   cursor: pointer;
 }
 
 .btn-primary {
-  background: #0066cc;
-  color: #fff;
+  background: var(--primary);
+  color: var(--on-primary);
 }
 
 .btn-primary:hover {
-  background: #0055aa;
+  background: var(--primary-hover);
 }
 
 .btn-primary:disabled {
-  background: #99c2e8;
+  background: var(--primary-disabled);
   cursor: default;
 }
 
 .btn-link {
   background: none;
-  color: #666;
+  color: var(--muted);
   padding: 4px 0;
   text-align: left;
   font-size: 12px;
   text-decoration: underline;
+}
+
+.preview {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--surface);
+}
+
+.preview-status {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.preview-status.warn {
+  color: var(--warning);
+}
+
+.preview-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+}
+
+.preview-fields[hidden] {
+  display: none;
+}
+
+.preview-row {
+  display: flex;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.preview-row dt {
+  flex: 0 0 62px;
+  color: var(--muted);
+}
+
+.preview-row dd {
+  margin: 0;
+  color: var(--text);
+  word-break: break-word;
+}
+
+.preview-row dd.missing {
+  color: var(--danger);
+}
+
+.screenshot-status {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.screenshot-status.ok {
+  color: var(--success);
 }
 
 .feedback {
@@ -118,16 +257,16 @@ body {
 }
 
 .feedback.success {
-  background: #e6f4ea;
-  color: #1e7e34;
+  background: var(--success-tint);
+  color: var(--success);
 }
 
 .feedback.duplicate {
-  background: #fff8e1;
-  color: #8a6d00;
+  background: var(--warning-tint);
+  color: var(--warning);
 }
 
 .feedback.error {
-  background: #fdecea;
-  color: #b3261e;
+  background: var(--danger-tint);
+  color: var(--danger);
 }

@@ -22,6 +22,7 @@ import {
   canonicalCompanyUrl,
   pickMostRecentPosition,
   collectProfileSignals,
+  hasUsableProfileData,
 } from "../extension/js/scraper.js";
 
 // ---------------------------------------------------------------------------
@@ -693,4 +694,36 @@ test("collectProfileSignals keeps waiting when stale JSON only mentions the curr
     globalThis.document = originalDocument;
     globalThis.setTimeout = originalSetTimeout;
   }
+});
+
+test("hasUsableProfileData distinguishes usable payloads from ones the backend would null out", () => {
+  assert.equal(hasUsableProfileData(null), false);
+  assert.equal(hasUsableProfileData(undefined), false);
+  assert.equal(
+    hasUsableProfileData({ fullName: null, headline: null, location: null, mostRecentPosition: null }),
+    false,
+  );
+  assert.equal(
+    hasUsableProfileData({ fullName: "Ada Lovelace", headline: null, location: null, mostRecentPosition: null }),
+    true,
+  );
+  assert.equal(
+    hasUsableProfileData({ fullName: null, headline: "Engineer", location: null, mostRecentPosition: null }),
+    true,
+  );
+  assert.equal(
+    hasUsableProfileData({
+      fullName: null,
+      headline: null,
+      location: null,
+      mostRecentPosition: {
+        title: null,
+        companyName: null,
+        companyUrl: "https://www.linkedin.com/company/acme",
+        isCurrent: false,
+        dateRange: null,
+      },
+    }),
+    true,
+  );
 });

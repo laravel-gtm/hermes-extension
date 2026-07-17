@@ -21,6 +21,7 @@ This is the version from the installed extension's `manifest.json` (read at runt
 | `GET` | `/api/extension/me` | Sanctum bearer token | `200` with user |
 | `GET` | `/api/extension/version` | None | `200` always, with supportability |
 | `POST` | `/api/extension/profiles` | Sanctum bearer token with `extension:capture` | `201` queued, `200` duplicate, or `200` unsupported version |
+| `POST` | `/api/extension/screenshots` | Sanctum bearer token with `extension:capture` | `201` with a signed upload URL and key |
 | `POST` | `/api/extension/auth/logout` | Sanctum bearer token | `204`, current token revoked |
 
 ## Browser authentication flow
@@ -251,6 +252,50 @@ Invalid URL — `422 Unprocessable Content`:
 ```
 
 Missing/invalid/revoked token returns `401`. An authenticated token without the required ability returns `403 Forbidden` using the standard error envelope.
+
+### `POST /api/extension/screenshots`
+
+Issues a one-time signed upload URL for a single JPEG screenshot frame of the
+profile page. The extension PUTs the image straight to object storage (the
+bytes never pass through the Hermes app), then references the returned `key`
+in the `screenshots` array of the profile submission. Requires the
+`extension:capture` ability; throttled via the `extension-screenshots`
+limiter (30/min per user).
+
+Success `201`:
+
+```json
+{
+  "key": "extension-screenshots/9a4c9c6e-1111-2222-3333-444455556666.jpg",
+  "url": "https://<account>.r2.cloudflarestorage.com/...signed...",
+  "headers": {}
+}
+```
+
+The URL expires after 5 minutes. Upload with `PUT`, `Content-Type: image/jpeg`,
+plus any returned `headers`.
+
+Uploaded keys ride along on the profile submission as the optional
+`screenshots` array (1–3 keys, ordered top of page first):
+
+```json
+{
+  "url": "https://www.linkedin.com/in/tessak22",
+  "page": { "fullName": "Tessa Kriesel", "headline": null, "location": null, "mostRecentPosition": null },
+  "screenshots": [
+    "extension-screenshots/<uuid>.jpg",
+    "extension-screenshots/<uuid>.jpg"
+  ]
+}
+```
+
+Like `page`, `screenshots` is best-effort and never rejects a submission:
+keys that don't match the `extension-screenshots/<uuid>.jpg` pattern are
+silently dropped, and anything beyond the 3-frame cap is truncated. The
+pipeline extracts profile data from the referenced frames server-side (AI
+vision) and merges it beneath the DOM-scraped `page` (page wins
+field-for-field), so submissions complete instantly regardless of model
+latency.
 
 ### `POST /api/extension/auth/logout`
 

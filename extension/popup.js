@@ -1,7 +1,15 @@
 import { getSession, setSession, clearSession } from "./js/storage.js";
-import { fetchMe, logout, submitProfile, checkVersion, UnauthorizedError } from "./js/api.js";
+import {
+  fetchMe,
+  logout,
+  submitProfile,
+  checkVersion,
+  createScreenshotUpload,
+  uploadScreenshot,
+  UnauthorizedError,
+} from "./js/api.js";
 import { isLinkedInUrl, isLinkedInProfileUrl, normalizeProfileUrl } from "./js/linkedin.js";
-import { collectProfileSignals, parseProfileFromRaw } from "./js/scraper.js";
+import { collectProfileSignals, parseProfileFromRaw, hasUsableProfileData } from "./js/scraper.js";
 
 const FALLBACK_RELEASE_URL = "https://github.com/laravel-gtm/hermes-extension/releases/latest";
 
@@ -27,7 +35,21 @@ const els = {
   profileUrl: document.getElementById("profile-url"),
   feedback: document.getElementById("feedback"),
   getLatestBtn: document.getElementById("get-latest-btn"),
+  previewStatus: document.getElementById("preview-status"),
+  previewFields: document.getElementById("preview-fields"),
+  previewName: document.getElementById("preview-name"),
+  previewHeadline: document.getElementById("preview-headline"),
+  previewLocation: document.getElementById("preview-location"),
+  previewPosition: document.getElementById("preview-position"),
+  screenshotStatus: document.getElementById("screenshot-status"),
 };
+
+// The capture chain kicked off when the popup opened on a profile: the DOM
+// scrape (previewed for the rep's QC) plus the screenshot frames uploaded
+// to object storage. The Add button submits exactly what this resolved to —
+// { page, screenshots } — and the pipeline extracts profile data from the
+// screenshots server-side after submission.
+let pendingCapture = null;
 
 function showState(name) {
   for (const [key, section] of Object.entries(states)) {
@@ -44,11 +66,6 @@ function showFeedback(message, kind) {
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab;
-}
-
-async function getActiveTabUrl() {
-  const tab = await getActiveTab();
-  return tab?.url || "";
 }
 
 // Scraping is best-effort: LinkedIn's DOM is obfuscated and changes without
@@ -75,6 +92,191 @@ async function capturePageData(tabId) {
 async function handleUnauthorized() {
   await clearSession();
   showState("signedOut");
+}
+
+// Injected into the page to position the viewport for a screenshot frame.
+// Self-contained (serialized via executeScript) — no module scope access.
+// LinkedIn's rebuilt UI scrolls an inner container inside an open shadow
+// root, not the window, so when the document itself has nothing to scroll
+// this hunts down the tallest scrollable element across document + open
+// shadow roots and scrolls that instead.
+function scrollForCapture(top) {
+  const findScroller = () => {
+    const doc = document.scrollingElement || document.documentElement;
+    if (doc.scrollHeight > doc.clientHeight + 10) return doc;
+
+    const roots = [];
+    const walk = (root) => {
+      roots.push(root);
+      for (const el of root.querySelectorAll("*")) {
+        if (el.shadowRoot) walk(el.shadowRoot);
+      }
+    };
+    try {
+      walk(document);
+    } catch {
+      return doc;
+    }
+
+    let best = doc;
+    let bestOverflow = 0;
+    for (const root of roots) {
+      for (const el of root.querySelectorAll("*")) {
+        const overflow = el.scrollHeight - el.clientHeight;
+        if (overflow > bestOverflow && el.clientHeight > 200) {
+          const style = getComputedStyle(el);
+          if (/(auto|scroll|overlay)/.test(style.overflowY)) {
+            best = el;
+            bestOverflow = overflow;
+          }
+        }
+      }
+    }
+    return best;
+  };
+
+  const el = findScroller();
+  el.scrollTop = top;
+  const isDocument = el === (document.scrollingElement || document.documentElement);
+  return {
+    top: el.scrollTop,
+    viewport: isDocument ? window.innerHeight : el.clientHeight,
+    max: el.scrollHeight,
+  };
+}
+
+// Five frames ≈ 4.5 viewport-heights of profile — enough to reach the
+// Experience section, which usually sits below Featured/Activity.
+const SCREENSHOT_MAX_FRAMES = 5;
+// captureVisibleTab is rate-limited (~2/sec) and lazy content needs a beat
+// to paint after each scroll.
+const SCREENSHOT_FRAME_DELAY_MS = 550;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Capture up to three sequential viewport screenshots (top of the profile
+// first), scrolling ~90% of a viewport between frames and restoring the
+// rep's scroll position afterwards. Returns JPEG blobs, [] on any failure.
+async function captureScreenshotFrames(tabId) {
+  const scrollTo = async (top) => {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: scrollForCapture,
+      args: [top],
+    });
+    return results?.[0]?.result || null;
+  };
+
+  const frames = [];
+  let originalTop = 0;
+  try {
+    const start = await scrollTo(0);
+    if (!start) return [];
+    originalTop = start.top;
+
+    let previousTop = -1;
+    for (let frame = 0; frame < SCREENSHOT_MAX_FRAMES; frame += 1) {
+      const position = await scrollTo(frame * start.viewport * 0.9);
+      if (!position || position.top === previousTop) break;
+      previousTop = position.top;
+
+      await sleep(SCREENSHOT_FRAME_DELAY_MS);
+      const dataUrl = await chrome.tabs.captureVisibleTab({ format: "jpeg", quality: 80 });
+      frames.push(await (await fetch(dataUrl)).blob());
+
+      // Bottom of the scroll container reached — nothing new below.
+      if (position.top + position.viewport >= position.max - 10) break;
+    }
+  } catch {
+    return [];
+  } finally {
+    try {
+      await scrollTo(originalTop);
+    } catch {
+      // leave the page where it is
+    }
+  }
+  return frames;
+}
+
+// Capture frames and upload each via a signed URL, returning the storage
+// keys to reference in the submission. Extraction itself happens in the
+// server-side pipeline after submit — the popup never waits on the vision
+// model. Best-effort: any failure returns [] and the DOM/URL-only path
+// proceeds as before.
+async function captureAndUploadScreenshots(tabId) {
+  try {
+    const frames = await captureScreenshotFrames(tabId);
+    if (!frames.length) return [];
+
+    const { token } = await getSession();
+    const keys = [];
+    for (const blob of frames) {
+      const upload = await createScreenshotUpload(token);
+      if (!upload) break;
+      if (await uploadScreenshot(upload.url, upload.headers, blob)) {
+        keys.push(upload.key);
+      }
+    }
+    return keys;
+  } catch {
+    return [];
+  }
+}
+
+function renderScreenshotStatus(state, count = 0) {
+  els.screenshotStatus.classList.remove("ok");
+  els.screenshotStatus.hidden = false;
+  if (state === "capturing") {
+    els.screenshotStatus.textContent = "Capturing screenshots…";
+  } else if (state === "attached") {
+    els.screenshotStatus.textContent =
+      `${count} screenshot${count === 1 ? "" : "s"} attached — Hermes extracts full details after submit.`;
+    els.screenshotStatus.classList.add("ok");
+  } else {
+    els.screenshotStatus.textContent =
+      "No screenshots captured — only the URL and details above will be sent.";
+  }
+}
+
+function setPreviewField(el, value) {
+  el.textContent = value || "—";
+  el.classList.toggle("missing", !value);
+}
+
+function renderPreviewLoading() {
+  els.previewStatus.textContent = "Reading profile…";
+  els.previewStatus.classList.remove("warn");
+  els.previewStatus.hidden = false;
+  els.previewFields.hidden = true;
+  els.screenshotStatus.hidden = true;
+}
+
+function describePosition(position) {
+  if (!position) return null;
+  const role = [position.title, position.companyName].filter(Boolean).join(" @ ");
+  return [role, position.dateRange].filter(Boolean).join(" · ") || null;
+}
+
+// Fill the manual-QC preview with what was scraped, so the rep confirms the
+// data before it is submitted. An unusable payload (which the backend would
+// store as null anyway) becomes an explicit warning instead of a silent
+// URL-only submission — the screenshot status line below says whether the
+// pipeline will still extract details after submit.
+function renderPreview(page) {
+  if (!hasUsableProfileData(page)) {
+    els.previewStatus.textContent = "Couldn't read the profile details from the page.";
+    els.previewStatus.classList.add("warn");
+    els.previewStatus.hidden = false;
+    els.previewFields.hidden = true;
+    return;
+  }
+
+  setPreviewField(els.previewName, page.fullName);
+  setPreviewField(els.previewHeadline, page.headline);
+  setPreviewField(els.previewLocation, page.location);
+  setPreviewField(els.previewPosition, describePosition(page.mostRecentPosition));
+  els.previewStatus.hidden = true;
+  els.previewFields.hidden = false;
 }
 
 function showUnsupported(data) {
@@ -106,7 +308,8 @@ async function checkAndGateVersion() {
 async function render() {
   showState("loading");
 
-  const tabUrl = await getActiveTabUrl();
+  const tab = await getActiveTab();
+  const tabUrl = tab?.url || "";
 
   // The extension only does anything on LinkedIn — show the blank state
   // everywhere else, signed in or not.
@@ -142,7 +345,29 @@ async function render() {
     els.feedback.hidden = true;
     els.addProfileBtn.disabled = false;
     els.addProfileBtn.textContent = "Add profile to Hermes";
+    renderPreviewLoading();
     showState("profile");
+
+    // Capture as soon as the popup opens: the fast DOM scrape renders
+    // immediately for the rep's QC, then screenshot frames upload in the
+    // background and update the status line. The Add button submits
+    // exactly what the finished chain resolves to; the pipeline extracts
+    // profile data from the screenshots server-side. Guard against a
+    // re-render (e.g. after sign-in) having started a newer capture.
+    const capture = (async () => {
+      if (tab?.id == null) return { page: null, screenshots: [] };
+      const page = await capturePageData(tab.id);
+      if (pendingCapture === capture) {
+        renderPreview(page);
+        renderScreenshotStatus("capturing");
+      }
+      const screenshots = await captureAndUploadScreenshots(tab.id);
+      if (pendingCapture === capture) {
+        renderScreenshotStatus(screenshots.length ? "attached" : "failed", screenshots.length);
+      }
+      return { page, screenshots };
+    })();
+    pendingCapture = capture;
   } else {
     els.accountName1.textContent = freshUser?.name || "";
     els.accountEmail1.textContent = freshUser?.email || "";
@@ -208,8 +433,17 @@ els.addProfileBtn.addEventListener("click", async () => {
     const { token } = await getSession();
     const tab = await getActiveTab();
     const url = normalizeProfileUrl(tab?.url || "");
-    const page = tab?.id != null ? await capturePageData(tab.id) : null;
-    const { status, data } = await submitProfile(token, url, page);
+    // Submit the same payload the preview showed — the whole point of the
+    // manual QC step — rather than scraping again behind the rep's back.
+    const { page, screenshots } = pendingCapture
+      ? await pendingCapture
+      : { page: null, screenshots: [] };
+    const { status, data } = await submitProfile(
+      token,
+      url,
+      page,
+      screenshots.length ? screenshots : null,
+    );
 
     if (status === 201) {
       showFeedback("Profile queued for Hermes.", "success");

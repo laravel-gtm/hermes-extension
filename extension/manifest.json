@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Hermes LinkedIn Capture",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "minimum_chrome_version": "103",
   "description": "Send LinkedIn profile URLs to Hermes with one click.",
   "background": {
@@ -25,5 +25,8 @@
     "128": "icons/icon128.png"
   },
   "permissions": ["identity", "storage", "activeTab", "scripting"],
-  "host_permissions": ["https://hermes.laravel-demo.cloud/*"]
+  "host_permissions": [
+    "https://hermes.laravel-demo.cloud/*",
+    "https://*.r2.cloudflarestorage.com/*"
+  ]
 }

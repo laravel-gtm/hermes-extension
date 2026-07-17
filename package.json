@@ -1,6 +1,6 @@
 {
   "name": "hermes-extension",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
   "type": "module",
   "description": "Dev tooling for the Hermes LinkedIn Capture extension. The shipped extension lives in extension/ and has no build step; this file only enables unit tests for the pure scraper logic and is NOT included in the release zip.",

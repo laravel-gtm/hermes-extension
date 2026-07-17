@@ -9,8 +9,10 @@
 //      it MUST be fully self-contained: no imports, no references to anything
 //      in this module's scope, nothing but DOM/window APIs. Its only job is to
 //      wait for the profile to hydrate and then harvest *raw material* —
-//      LinkedIn's embedded Voyager JSON blobs plus a handful of raw DOM text
-//      candidates. It does no interpretation, so it stays small and stable.
+//      LinkedIn's embedded Voyager JSON blobs (classic UI) plus raw DOM text
+//      candidates gathered across document AND every open shadow root (the
+//      rebuilt React UI renders the whole page inside one). It does no
+//      interpretation, so it stays small and stable.
 //
 //   2. parseProfileFromRaw() and its helpers — PURE functions that run back in
 //      the popup (normal module scope). They turn the raw material into the
@@ -36,10 +38,21 @@
 // and validation happens later in parseProfileFromRaw(). Async so it can wait
 // out lazy hydration — executeScript awaits the returned promise and hands the
 // resolved value back as InjectionResult.result.
+//
+// LinkedIn now ships two profile UIs. The classic (Ember/Voyager) markup has
+// <h1>/<h2> headings, an #experience anchor, and bootstrap JSON in <code>
+// elements — all in the light DOM. The rebuilt (React) UI renders the entire
+// page inside open shadow roots, has NO headings, NO #experience anchor, NO
+// embedded JSON, and hashed class names; the only stable signals left are the
+// tab title ("Name | LinkedIn"), role="list"/"listitem" containers, literal
+// section labels, /company/ anchors, and aria-hidden text spans. Every query
+// below therefore runs across document + every open shadow root, with the
+// classic selectors kept as the preferred path.
 export async function collectProfileSignals() {
   const STEP_MS = 250;
   const MAX_ATTEMPTS = 16; // ~4s of hydration budget
   const MAX_BLOB_CHARS = 4_000_000;
+  const MAX_LEAF_TEXTS = 30;
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -57,14 +70,113 @@ export async function collectProfileSignals() {
     }
   };
 
-  // LinkedIn bootstraps Voyager API responses into <code> (and sometimes
-  // <script type="application/json">) elements. Keep only blobs that look like
-  // JSON and mention a relevant marker, so the payload shuttled back across the
-  // executeScript boundary stays small.
-  const collectVoyagerBlobs = () => {
+  // document + every OPEN shadow root, depth-first in DOM order. Closed
+  // shadow roots stay invisible, but the rebuilt profile keeps its content
+  // in open ones.
+  const collectRoots = () => {
+    const roots = [];
+    const walk = (root) => {
+      roots.push(root);
+      let all;
+      try {
+        all = root.querySelectorAll("*");
+      } catch {
+        return;
+      }
+      for (const el of all) {
+        if (el.shadowRoot) walk(el.shadowRoot);
+      }
+    };
+    try {
+      walk(document);
+    } catch {
+      // ignore — roots keeps whatever was collected
+    }
+    return roots;
+  };
+
+  const queryAllDeep = (roots, selector) => {
+    const found = [];
+    for (const root of roots) {
+      try {
+        found.push(...root.querySelectorAll(selector));
+      } catch {
+        // ignore this root
+      }
+    }
+    return found;
+  };
+
+  // Walk upward through ancestors, crossing shadow boundaries via the host.
+  const parentOf = (el) =>
+    el.parentElement || (el.getRootNode && el.getRootNode().host) || null;
+
+  // The rebuilt profile has no <h1>, so the tab title is the most stable name
+  // source: "(3) Tessa Kriesel | LinkedIn" → "Tessa Kriesel". LinkedIn keeps
+  // the title in sync on SPA navigations.
+  const titleName = () => {
+    try {
+      const title = (clean(document.title) || "").replace(/^\(\d+\)\s*/, "");
+      const match = title.match(/^(.+?)\s*\|\s*LinkedIn$/i);
+      return match ? clean(match[1]) : null;
+    } catch {
+      return null;
+    }
+  };
+
+  // The top-card name element: a real heading when the classic markup is
+  // present, else the first element in DOM order whose entire text is the
+  // title-derived name, tolerating a short suffix (verification badge,
+  // "• 1st") that the top card renders inline with it. The rebuilt UI wraps
+  // the top-card name in a link to the profile ITSELF, so anchors are
+  // allowed — but a name-bearing link pointing at anyone else's profile
+  // ("people also viewed", search results) is never this page's top card.
+  const findNameElement = (roots, name) => {
+    try {
+      for (const h of queryAllDeep(roots, "main h1, h1")) {
+        if (clean(h.textContent)) return h;
+      }
+      if (!name) return null;
+      const slug = (profileSlug() || "").toLowerCase();
+      let looseMatch = null;
+      for (const el of queryAllDeep(roots, "*")) {
+        const tag = el.tagName;
+        if (tag === "SCRIPT" || tag === "STYLE" || tag === "TITLE" || tag === "META") continue;
+        const text = clean(el.textContent);
+        if (!text || !text.includes(name) || text.length > name.length + 15) continue;
+        if (el.closest && el.closest("button")) continue;
+        const anchor = el.closest && el.closest("a");
+        if (anchor && slug) {
+          const href = (anchor.getAttribute("href") || "").toLowerCase();
+          if (href && !href.includes(`/in/${slug}`)) continue;
+        }
+        // Descend through single-child wrappers to the innermost element that
+        // still carries the whole name.
+        let leaf = el;
+        while (
+          leaf.children.length === 1 &&
+          (clean(leaf.children[0].textContent) || "").includes(name)
+        ) {
+          leaf = leaf.children[0];
+        }
+        if (text === name) return leaf;
+        if (!looseMatch) looseMatch = leaf;
+      }
+      return looseMatch;
+    } catch {
+      // ignore
+    }
+    return null;
+  };
+
+  // Both UIs bootstrap-JSON check: the classic markup embeds Voyager API
+  // responses in <code>/<script type="application/json"> elements. The rebuilt
+  // UI has none — this then simply returns [] and the DOM signals carry the
+  // capture.
+  const collectVoyagerBlobs = (roots) => {
     const blobs = [];
     try {
-      const nodes = document.querySelectorAll('code, script[type="application/json"]');
+      const nodes = queryAllDeep(roots, 'code, script[type="application/json"]');
       for (const node of nodes) {
         const text = node.textContent;
         if (!text) continue;
@@ -82,65 +194,99 @@ export async function collectProfileSignals() {
     return blobs;
   };
 
-  const topCardH1 = () => {
-    try {
-      const h1 = document.querySelector("main h1") || document.querySelector("h1");
-      return clean(h1 && h1.textContent);
-    } catch {
-      return null;
-    }
-  };
-
-  // The top card orders plain-text leaves as name (h1), headline, location,
-  // then linked actions/stats. Collect leaf text in DOM order, skipping links
-  // and buttons; the pure layer applies noise filtering and picks headline vs
-  // location. We only harvest here.
-  const collectTopCard = () => {
+  // Climb from the name element to the LARGEST container that stays under a
+  // ~40-distinct-text ceiling, then harvest its plain-text leaves in DOM
+  // order — the pure layer filters noise and picks headline vs location.
+  // Stopping at the first "rich enough" container is not safe: the name block
+  // alone (name + pronouns + degree badge) can look rich while the headline
+  // and location still live one level up. Ballooning past the ceiling means
+  // we've climbed out of the top card into the page shell, so the previous,
+  // tighter harvest wins.
+  const collectTopCard = (roots) => {
     const result = { h1Text: null, leafTexts: [] };
     try {
-      const h1 = document.querySelector("main h1") || document.querySelector("h1");
-      if (!h1) return result;
-      result.h1Text = clean(h1.textContent);
+      const name = titleName();
+      const nameEl = findNameElement(roots, name);
+      // A loose element match can carry a "• 1st" suffix that would fail the
+      // pure layer's digit check — prefer the clean title-derived name.
+      const elText = nameEl ? clean(nameEl.textContent) : null;
+      result.h1Text = !name || elText === name ? elText : name;
+      if (!nameEl) return result;
 
-      const card =
-        h1.closest("section") ||
-        (h1.parentElement && h1.parentElement.parentElement) ||
-        h1.parentElement;
-      if (!card) return result;
-
-      const leaves = Array.from(card.querySelectorAll("*")).filter(
-        (el) => el.children.length === 0 && !el.closest("a") && !el.closest("button"),
-      );
-      for (const el of leaves) {
-        const text = clean(el.textContent);
-        if (text) result.leafTexts.push(text);
+      // The name leaf can sit several wrapper levels below its anchor, and
+      // the top card several levels above it — the text ceiling is the real
+      // stop condition, so the hop budget errs generous.
+      let container = nameEl;
+      let best = null;
+      for (let i = 0; i < 12 && container; i += 1) {
+        const leaves = container.querySelectorAll
+          ? Array.from(container.querySelectorAll("*")).filter(
+              (el) => el.children.length === 0 && !el.closest("a") && !el.closest("button"),
+            )
+          : [];
+        const texts = [];
+        const seen = new Set();
+        for (const el of leaves) {
+          const text = clean(el.textContent);
+          if (text && !seen.has(text)) {
+            seen.add(text);
+            texts.push(text);
+          }
+        }
+        if (texts.length > 40) break;
+        best = texts;
+        container = parentOf(container);
       }
+      result.leafTexts = (best || []).slice(0, MAX_LEAF_TEXTS);
     } catch {
       // ignore
     }
     return result;
   };
 
-  const collectExperience = () => {
+  // The rebuilt UI puts role="list" on the <section> element itself, so a
+  // container "having" a list must check self as well as descendants.
+  const listWithin = (node) => {
+    if (!node) return null;
+    if (node.matches && node.matches('ul, [role="list"]')) return node;
+    return node.querySelector ? node.querySelector('ul, [role="list"]') : null;
+  };
+
+  // Classic markup: the #experience anchor or an <h2>. Rebuilt markup: any
+  // element (outside links/buttons/nav chips) whose entire text is literally
+  // "Experience", climbing to the nearest ancestor that carries an entry
+  // list. English-only, like the h2 fallback before it — a known limitation.
+  const findExperienceSection = (roots) => {
+    for (const anchor of queryAllDeep(roots, '[id="experience"]')) {
+      const section =
+        (anchor.closest && anchor.closest("section")) ||
+        (anchor.parentElement && anchor.parentElement.closest("section"));
+      if (section) return section;
+    }
+
+    const labels = queryAllDeep(roots, "h2, span, div").filter((el) => {
+      if ((clean(el.textContent) || "").toLowerCase() !== "experience") return false;
+      return !el.closest || (!el.closest("a") && !el.closest("button"));
+    });
+    for (const label of labels) {
+      let node = label;
+      for (let i = 0; i < 6 && node; i += 1) {
+        const list = listWithin(node);
+        if (list && list.querySelector('li, [role="listitem"]')) return node;
+        node = parentOf(node);
+      }
+    }
+    return null;
+  };
+
+  const collectExperience = (roots) => {
     const result = { boldTexts: [], companyAnchorText: null, companyHref: null };
     try {
-      let section = null;
-      const anchor = document.getElementById("experience");
-      if (anchor) {
-        section =
-          anchor.closest("section") ||
-          (anchor.parentElement && anchor.parentElement.closest("section"));
-      }
-      if (!section) {
-        const heading = Array.from(document.querySelectorAll("h2")).find(
-          (el) => (clean(el.textContent) || "").toLowerCase() === "experience",
-        );
-        section = heading ? heading.closest("section") : null;
-      }
+      const section = findExperienceSection(roots);
       if (!section) return result;
 
-      const list = section.querySelector("ul");
-      const topEntry = list && list.querySelector("li");
+      const list = listWithin(section);
+      const topEntry = list && list.querySelector('li, [role="listitem"]');
       if (!topEntry) return result;
 
       const companyAnchor = topEntry.querySelector('a[href*="/company/"]');
@@ -149,39 +295,49 @@ export async function collectProfileSignals() {
         result.companyHref = companyAnchor.href || null;
       }
 
-      // A grouped multi-role entry nests each role in its own <li>; the topmost
-      // nested role holds this entry's most-recent title/dates.
-      const nestedTopRole = topEntry.querySelector("ul li");
+      // A grouped multi-role entry nests each role in its own item; the
+      // topmost nested role holds this entry's most-recent title/dates.
+      const nestedTopRole = topEntry.querySelector('ul li, [role="list"] [role="listitem"]');
       const scope = nestedTopRole || topEntry;
 
-      // LinkedIn mirrors visible text into aria-hidden spans (paired with a
-      // visually-hidden accessible copy) — the most stable hook short of exact
-      // class names.
+      // Classic markup mirrors visible text into aria-hidden spans. The
+      // rebuilt markup doesn't always; fall back to the entry's plain-text
+      // leaves in DOM order (title, company, dates …) and let the pure layer
+      // sanitize each candidate.
       result.boldTexts = Array.from(scope.querySelectorAll('span[aria-hidden="true"]'))
         .map((el) => clean(el.textContent))
         .filter(Boolean);
+
+      if (!result.boldTexts.length) {
+        result.boldTexts = Array.from(scope.querySelectorAll("*"))
+          .filter((el) => el.children.length === 0)
+          .map((el) => clean(el.textContent))
+          .filter(Boolean)
+          .slice(0, 12);
+      }
     } catch {
       // ignore
     }
     return result;
   };
 
-  // Consider the page ready once the top card has painted, or once bootstrap
-  // JSON carrying a member name is present. The capture button can fire before
-  // either is true on a cold/slow load, so poll briefly. On an SPA navigation
-  // the *previous* person's bootstrap JSON can still be sitting in the DOM —
-  // only treat that JSON as signalling hydration when it actually mentions the
-  // slug we're currently on, so a stale blob doesn't stop the wait early and
-  // get treated as authoritative for the new page.
-  const hydrated = () => {
-    if (topCardH1()) return true;
+  // Consider the page ready once the person's name is findable (classic h1 or
+  // title-derived match in the rebuilt UI), or once bootstrap JSON carrying a
+  // member name is present. The capture button can fire before either is true
+  // on a cold/slow load, so poll briefly. On an SPA navigation the *previous*
+  // person's bootstrap JSON can still be sitting in the DOM — only treat that
+  // JSON as signalling hydration when it actually mentions the slug we're
+  // currently on, so a stale blob doesn't stop the wait early and get treated
+  // as authoritative for the new page.
+  const hydrated = (roots) => {
+    if (findNameElement(roots, titleName())) return true;
     try {
       const slug = profileSlug();
       const escapedSlug = slug && slug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const publicIdentifier = escapedSlug
         ? new RegExp(`"publicIdentifier"\\s*:\\s*"${escapedSlug}"`, "i")
         : null;
-      const nodes = document.querySelectorAll('code, script[type="application/json"]');
+      const nodes = queryAllDeep(roots, 'code, script[type="application/json"]');
       for (const node of nodes) {
         const text = node.textContent || "";
         if (!text.includes('"firstName"')) continue;
@@ -193,16 +349,19 @@ export async function collectProfileSignals() {
     return false;
   };
 
+  let roots = collectRoots();
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
-    if (hydrated()) break;
+    if (hydrated(roots)) break;
     await sleep(STEP_MS);
+    roots = collectRoots();
   }
 
   return {
     slug: profileSlug(),
-    voyager: collectVoyagerBlobs(),
-    topCard: collectTopCard(),
-    experience: collectExperience(),
+    pageTitleName: titleName(),
+    voyager: collectVoyagerBlobs(roots),
+    topCard: collectTopCard(roots),
+    experience: collectExperience(roots),
   };
 }
 
@@ -804,6 +963,20 @@ export function mergeProfile(primary, fallback) {
 
 function emptyPayload() {
   return { fullName: null, headline: null, location: null, mostRecentPosition: null };
+}
+
+// True when the parsed payload carries at least one usable field. Mirrors the
+// backend's has-usable-field check: a payload failing this is stored as null
+// server-side, so the popup uses it to warn the rep that only the URL would
+// effectively be submitted.
+export function hasUsableProfileData(page) {
+  if (!page || typeof page !== "object") return false;
+  if (page.fullName || page.headline || page.location) return true;
+  const position = page.mostRecentPosition;
+  return !!(
+    position &&
+    (position.title || position.companyName || position.companyUrl || position.dateRange)
+  );
 }
 
 // Turn the collector's raw signals into the final payload. Voyager JSON is the
